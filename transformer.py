@@ -5,7 +5,6 @@
 # * *[Original](https://nlp.seas.harvard.edu/2018/04/03/attention.html):
 #    [Sasha Rush](http://rush-nlp.com/).*
 
-# %% id="v1-1MX6oTsp9"
 import os
 from os.path import exists
 import torch
@@ -37,7 +36,6 @@ RUN_EXAMPLES = True
 # %%
 # Some convenience helper functions used throughout the notebook
 
-
 def is_interactive_notebook():
     return __name__ == "__main__"
 
@@ -68,70 +66,13 @@ class DummyScheduler:
     def step(self):
         None
 
-
-# %% [markdown] id="jx49WRyfTsp-"
-# > My comments are blockquoted. The main text is all from the paper itself.
-
-# %% [markdown] id="7phVeWghTsp_"
-# # Background
-
-# %% [markdown] id="83ZDS91dTsqA"
-#
-# The goal of reducing sequential computation also forms the
-# foundation of the Extended Neural GPU, ByteNet and ConvS2S, all of
-# which use convolutional neural networks as basic building block,
-# computing hidden representations in parallel for all input and
-# output positions. In these models, the number of operations required
-# to relate signals from two arbitrary input or output positions grows
-# in the distance between positions, linearly for ConvS2S and
-# logarithmically for ByteNet. This makes it more difficult to learn
-# dependencies between distant positions. In the Transformer this is
-# reduced to a constant number of operations, albeit at the cost of
-# reduced effective resolution due to averaging attention-weighted
-# positions, an effect we counteract with Multi-Head Attention.
-#
-# Self-attention, sometimes called intra-attention is an attention
-# mechanism relating different positions of a single sequence in order
-# to compute a representation of the sequence. Self-attention has been
-# used successfully in a variety of tasks including reading
-# comprehension, abstractive summarization, textual entailment and
-# learning task-independent sentence representations. End-to-end
-# memory networks are based on a recurrent attention mechanism instead
-# of sequencealigned recurrence and have been shown to perform well on
-# simple-language question answering and language modeling tasks.
-#
-# To the best of our knowledge, however, the Transformer is the first
-# transduction model relying entirely on self-attention to compute
-# representations of its input and output without using sequence
-# aligned RNNs or convolution.
-
-# %% [markdown]
-# # Part 1: Model Architecture
-
-# %% [markdown] id="pFrPajezTsqB"
-# # Model Architecture
-
-# %% [markdown] id="ReuU_h-fTsqB"
-#
-# Most competitive neural sequence transduction models have an
-# encoder-decoder structure
-# [(cite)](https://arxiv.org/abs/1409.0473). Here, the encoder maps an
-# input sequence of symbol representations $(x_1, ..., x_n)$ to a
-# sequence of continuous representations $\mathbf{z} = (z_1, ...,
-# z_n)$. Given $\mathbf{z}$, the decoder then generates an output
-# sequence $(y_1,...,y_m)$ of symbols one element at a time. At each
-# step the model is auto-regressive
-# [(cite)](https://arxiv.org/abs/1308.0850), consuming the previously
-# generated symbols as additional input when generating the next.
-
-# %% id="k0XGXhzRTsqB"
 class EncoderDecoder(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many
     other models.
     """
 
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+    def __init__(self, encoder:nn.Module, decoder:nn.Module, src_embed:nn.Module, tgt_embed:nn.Module, generator:nn.Module):
         super(EncoderDecoder, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -139,201 +80,153 @@ class EncoderDecoder(nn.Module):
         self.tgt_embed = tgt_embed
         self.generator = generator
 
-    def forward(self, src, tgt, src_mask, tgt_mask):
+    # src_ids:[batch_size, max_in_seq_len]
+    # tgt_ids:[batch_size, max_out_seq_len]
+    # src_mask:[batch_size, max_in_seq_len]
+    # tgt_mask:[batch_size, max_out_seq_len]
+    def forward(self, src_ids, tgt_ids, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
-        return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
+        # 先encode,再decode
+        enc = self.encode(src_ids, src_mask)
+        return self.decode(enc, src_mask, tgt_ids, tgt_mask)
 
-    def encode(self, src, src_mask):
-        return self.encoder(self.src_embed(src), src_mask)
+    def encode(self, src_ids, src_mask):
+        embed = self.src_embed(src_ids)
+        return self.encoder(embed, src_mask)
 
-    def decode(self, memory, src_mask, tgt, tgt_mask):
-        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+    def decode(self, encoder_memory, src_mask, tgt_ids, tgt_mask):
+        embed = self.tgt_embed(tgt_ids)
+        return self.decoder(embed, encoder_memory, src_mask, tgt_mask)
 
 
-# %% id="NKGoH2RsTsqC"
 class Generator(nn.Module):
     "Define standard linear + softmax generation step."
 
-    def __init__(self, d_model, vocab):
+    def __init__(self, d_model:int, vocab:int):
         super(Generator, self).__init__()
-        self.proj = nn.Linear(d_model, vocab)
+        self.proj = nn.Linear(in_features=d_model, out_features=vocab)
 
+    # x:[batch_size, target_seq_len, d_model]
     def forward(self, x):
-        return log_softmax(self.proj(x), dim=-1)
+        return log_softmax(input=self.proj(x), dim=-1) #Applies a softmax followed by a logarithm
 
 
-# %% [markdown] id="mOoEnF_jTsqC"
-#
-# The Transformer follows this overall architecture using stacked
-# self-attention and point-wise, fully connected layers for both the
-# encoder and decoder, shown in the left and right halves of Figure 1,
-# respectively.
-
-# %% [markdown] id="oredWloYTsqC"
-# ![](images/ModalNet-21.png)
-
-
-# %% [markdown] id="bh092NZBTsqD"
-# ## Encoder and Decoder Stacks
-#
-# ### Encoder
-#
-# The encoder is composed of a stack of $N=6$ identical layers.
-
-# %% id="2gxTApUYTsqD"
-def clones(module, N):
+def clones(module:nn.Module, N:int):
     "Produce N identical layers."
-    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+    return nn.ModuleList(modules=[copy.deepcopy(module) for _ in range(N)])
 
-
-# %% id="xqVTz9MkTsqD"
 class Encoder(nn.Module):
     "Core encoder is a stack of N layers"
 
-    def __init__(self, layer, N):
+    def __init__(self, layer:EncoderLayer, N:int=6):
         super(Encoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.size)
+        self.layers:EncoderLayer = clones(layer, N)
+        self.norm = LayerNorm(features=layer.size)
 
     def forward(self, x, mask):
         "Pass the input (and mask) through each layer in turn."
-        for layer in self.layers:
+        for layer in self.layers: # 6层transformer
             x = layer(x, mask)
-        return self.norm(x)
+        return self.norm(x) # layer_norm
 
 
-# %% [markdown] id="GjAKgjGwTsqD"
 #
 # We employ a residual connection
 # [(cite)](https://arxiv.org/abs/1512.03385) around each of the two
 # sub-layers, followed by layer normalization
 # [(cite)](https://arxiv.org/abs/1607.06450).
 
-# %% id="3jKa_prZTsqE"
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)."
 
-    def __init__(self, features, eps=1e-6):
+    def __init__(self, features:int, eps=1e-6):
         super(LayerNorm, self).__init__()
+        # a_2,b_2为需要学习的参数
         self.a_2 = nn.Parameter(torch.ones(features))
         self.b_2 = nn.Parameter(torch.zeros(features))
         self.eps = eps
 
     def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
-
-# %% [markdown] id="nXSJ3QYmTsqE"
-#
-# That is, the output of each sub-layer is $\mathrm{LayerNorm}(x +
-# \mathrm{Sublayer}(x))$, where $\mathrm{Sublayer}(x)$ is the function
-# implemented by the sub-layer itself.  We apply dropout
-# [(cite)](http://jmlr.org/papers/v15/srivastava14a.html) to the
-# output of each sub-layer, before it is added to the sub-layer input
-# and normalized.
-#
-# To facilitate these residual connections, all sub-layers in the
-# model, as well as the embedding layers, produce outputs of dimension
-# $d_{\text{model}}=512$.
-
-# %% id="U1P7zI0eTsqE"
-class SublayerConnection(nn.Module):
+class LayerNormResidual(nn.Module):
     """
     A residual connection followed by a layer norm.
     Note for code simplicity the norm is first as opposed to last.
     """
 
-    def __init__(self, size, dropout):
-        super(SublayerConnection, self).__init__()
+    def __init__(self, size:int, dropout:float):
+        super(LayerNormResidual, self).__init__()
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, sublayer):
+    def forward(self, x, sublayer:nn.Module):
         "Apply residual connection to any sublayer with the same size."
-        return x + self.dropout(sublayer(self.norm(x)))
+        # residual layer在之前会layer_norm,之后会drop_out
+        """
+        1. layer norm
+        2. sublayer
+        3. dropout
+        4. add
+        """
+        normed = self.norm(x)
+        sub_out = sublayer(normed)
+        dropped = self.dropout(sub_out)
+        return x + dropped
 
-
-# %% [markdown] id="ML6oDlEqTsqE"
-#
-# Each layer has two sub-layers. The first is a multi-head
-# self-attention mechanism, and the second is a simple, position-wise
-# fully connected feed-forward network.
-
-# %% id="qYkUFr6GTsqE"
 class EncoderLayer(nn.Module):
     "Encoder is made up of self-attn and feed forward (defined below)"
 
-    def __init__(self, size, self_attn, feed_forward, dropout):
+    def __init__(self, size:int, self_attn:MultiHeadedAttention, feed_forward:PositionwiseFeedForward, dropout:float):
         super(EncoderLayer, self).__init__()
-        self.self_attn = self_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.self_attn:MultiHeadedAttention = self_attn
+        self.feed_forward:PositionwiseFeedForward = feed_forward
+        self.residualLayers = clones(LayerNormResidual(size, dropout), N=2)
         self.size = size
 
     def forward(self, x, mask):
         "Follow Figure 1 (left) for connections."
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
-        return self.sublayer[1](x, self.feed_forward)
+        """
+        1. multi-head attention
+        2. residual + layer norm + dropout
+        3. feed forward 
+        4. residual + layer norm + dropout
+        """
+        x = self.residualLayers[0](x, sublayer=lambda x: self.self_attn(query=x, key=x, value=x, mask=mask))
+        return self.residualLayers[1](x, sublayer=self.feed_forward)
 
-
-# %% [markdown] id="7ecOQIhkTsqF"
-# ### Decoder
-#
-# The decoder is also composed of a stack of $N=6$ identical layers.
-#
-
-# %%
 class Decoder(nn.Module):
     "Generic N layer decoder with masking."
 
-    def __init__(self, layer, N):
+    def __init__(self, layer:DecoderLayer, N:int):
         super(Decoder, self).__init__()
         self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.size)
+        self.norm = LayerNorm(features=layer.size)
 
     def forward(self, x, memory, src_mask, tgt_mask):
         for layer in self.layers:
             x = layer(x, memory, src_mask, tgt_mask)
         return self.norm(x)
 
-
-# %% [markdown] id="dXlCB12pTsqF"
-#
-# In addition to the two sub-layers in each encoder layer, the decoder
-# inserts a third sub-layer, which performs multi-head attention over
-# the output of the encoder stack.  Similar to the encoder, we employ
-# residual connections around each of the sub-layers, followed by
-# layer normalization.
-
-# %% id="M2hA1xFQTsqF"
 class DecoderLayer(nn.Module):
     "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
 
-    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
+    def __init__(self, size:int, self_attn:MultiHeadedAttention, src_attn:MultiHeadedAttention, feed_forward:PositionwiseFeedForward, dropout:float):
         super(DecoderLayer, self).__init__()
         self.size = size
-        self.self_attn = self_attn
+        self.self_attn:MultiHeadedAttention = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+        self.sublayer = clones(LayerNormResidual(size, dropout), 3)
 
-    def forward(self, x, memory, src_mask, tgt_mask):
+    def forward(self, x, encoder_memory, src_mask, tgt_mask):
         "Follow Figure 1 (right) for connections."
-        m = memory
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, encoder_memory, encoder_memory, src_mask))
         return self.sublayer[2](x, self.feed_forward)
 
-
-# %% [markdown] id="FZz5rLl4TsqF"
-#
-# We also modify the self-attention sub-layer in the decoder stack to
-# prevent positions from attending to subsequent positions.  This
-# masking, combined with fact that the output embeddings are offset by
-# one position, ensures that the predictions for position $i$ can
-# depend only on the known outputs at positions less than $i$.
 
 # %% id="QN98O2l3TsqF"
 def subsequent_mask(size):
@@ -344,14 +237,6 @@ def subsequent_mask(size):
     )
     return subsequent_mask == 0
 
-
-# %% [markdown] id="Vg_f_w-PTsqG"
-#
-# > Below the attention mask shows the position each tgt word (row) is
-# > allowed to look at (column). Words are blocked for attending to
-# > future words during training.
-
-# %% id="ht_FtgYAokC4"
 def example_mask():
     LS_data = pd.concat(
         [
@@ -380,40 +265,7 @@ def example_mask():
     )
 
 
-show_example(example_mask)
 
-# %% [markdown] id="Qto_yg7BTsqG"
-# ### Attention
-#
-# An attention function can be described as mapping a query and a set
-# of key-value pairs to an output, where the query, keys, values, and
-# output are all vectors.  The output is computed as a weighted sum of
-# the values, where the weight assigned to each value is computed by a
-# compatibility function of the query with the corresponding key.
-#
-# We call our particular attention "Scaled Dot-Product Attention".
-# The input consists of queries and keys of dimension $d_k$, and
-# values of dimension $d_v$.  We compute the dot products of the query
-# with all keys, divide each by $\sqrt{d_k}$, and apply a softmax
-# function to obtain the weights on the values.
-#
-#
-#
-# ![](images/ModalNet-19.png)
-
-
-# %% [markdown] id="EYJLWk6cTsqG"
-#
-# In practice, we compute the attention function on a set of queries
-# simultaneously, packed together into a matrix $Q$.  The keys and
-# values are also packed together into matrices $K$ and $V$.  We
-# compute the matrix of outputs as:
-#
-# $$
-#    \mathrm{Attention}(Q, K, V) = \mathrm{softmax}(\frac{QK^T}{\sqrt{d_k}})V
-# $$
-
-# %% id="qsoVxS5yTsqG"
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1)
@@ -426,72 +278,14 @@ def attention(query, key, value, mask=None, dropout=None):
     return torch.matmul(p_attn, value), p_attn
 
 
-# %% [markdown] id="jUkpwu8kTsqG"
-#
-# The two most commonly used attention functions are additive
-# attention [(cite)](https://arxiv.org/abs/1409.0473), and dot-product
-# (multiplicative) attention.  Dot-product attention is identical to
-# our algorithm, except for the scaling factor of
-# $\frac{1}{\sqrt{d_k}}$. Additive attention computes the
-# compatibility function using a feed-forward network with a single
-# hidden layer.  While the two are similar in theoretical complexity,
-# dot-product attention is much faster and more space-efficient in
-# practice, since it can be implemented using highly optimized matrix
-# multiplication code.
-#
-#
-# While for small values of $d_k$ the two mechanisms perform
-# similarly, additive attention outperforms dot product attention
-# without scaling for larger values of $d_k$
-# [(cite)](https://arxiv.org/abs/1703.03906). We suspect that for
-# large values of $d_k$, the dot products grow large in magnitude,
-# pushing the softmax function into regions where it has extremely
-# small gradients (To illustrate why the dot products get large,
-# assume that the components of $q$ and $k$ are independent random
-# variables with mean $0$ and variance $1$.  Then their dot product,
-# $q \cdot k = \sum_{i=1}^{d_k} q_ik_i$, has mean $0$ and variance
-# $d_k$.). To counteract this effect, we scale the dot products by
-# $\frac{1}{\sqrt{d_k}}$.
-#
-#
-
-# %% [markdown] id="bS1FszhVTsqG"
-# ![](images/ModalNet-20.png)
-
-
-# %% [markdown] id="TNtVyZ-pTsqH"
-#
-# Multi-head attention allows the model to jointly attend to
-# information from different representation subspaces at different
-# positions. With a single attention head, averaging inhibits this.
-#
-# $$
-# \mathrm{MultiHead}(Q, K, V) =
-#     \mathrm{Concat}(\mathrm{head_1}, ..., \mathrm{head_h})W^O \\
-#     \text{where}~\mathrm{head_i} = \mathrm{Attention}(QW^Q_i, KW^K_i, VW^V_i)
-# $$
-#
-# Where the projections are parameter matrices $W^Q_i \in
-# \mathbb{R}^{d_{\text{model}} \times d_k}$, $W^K_i \in
-# \mathbb{R}^{d_{\text{model}} \times d_k}$, $W^V_i \in
-# \mathbb{R}^{d_{\text{model}} \times d_v}$ and $W^O \in
-# \mathbb{R}^{hd_v \times d_{\text{model}}}$.
-#
-# In this work we employ $h=8$ parallel attention layers, or
-# heads. For each of these we use $d_k=d_v=d_{\text{model}}/h=64$. Due
-# to the reduced dimension of each head, the total computational cost
-# is similar to that of single-head attention with full
-# dimensionality.
-
-# %% id="D2LBMKCQTsqH"
 class MultiHeadedAttention(nn.Module):
-    def __init__(self, h, d_model, dropout=0.1):
+    def __init__(self, head_num:int, d_model:int, dropout:float=0.1):
         "Take in model size and number of heads."
         super(MultiHeadedAttention, self).__init__()
-        assert d_model % h == 0
+        assert d_model % head_num == 0
         # We assume d_v always equals d_k
-        self.d_k = d_model // h
-        self.h = h
+        self.d_k = d_model // head_num
+        self.h = head_num
         self.linears = clones(nn.Linear(d_model, d_model), 4)
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
@@ -525,53 +319,6 @@ class MultiHeadedAttention(nn.Module):
         del value
         return self.linears[-1](x)
 
-
-# %% [markdown] id="EDRba3J3TsqH"
-# ### Applications of Attention in our Model
-#
-# The Transformer uses multi-head attention in three different ways:
-# 1) In "encoder-decoder attention" layers, the queries come from the
-# previous decoder layer, and the memory keys and values come from the
-# output of the encoder.  This allows every position in the decoder to
-# attend over all positions in the input sequence.  This mimics the
-# typical encoder-decoder attention mechanisms in sequence-to-sequence
-# models such as [(cite)](https://arxiv.org/abs/1609.08144).
-#
-#
-# 2) The encoder contains self-attention layers.  In a self-attention
-# layer all of the keys, values and queries come from the same place,
-# in this case, the output of the previous layer in the encoder.  Each
-# position in the encoder can attend to all positions in the previous
-# layer of the encoder.
-#
-#
-# 3) Similarly, self-attention layers in the decoder allow each
-# position in the decoder to attend to all positions in the decoder up
-# to and including that position.  We need to prevent leftward
-# information flow in the decoder to preserve the auto-regressive
-# property.  We implement this inside of scaled dot-product attention
-# by masking out (setting to $-\infty$) all values in the input of the
-# softmax which correspond to illegal connections.
-
-# %% [markdown] id="M-en97_GTsqH"
-# ## Position-wise Feed-Forward Networks
-#
-# In addition to attention sub-layers, each of the layers in our
-# encoder and decoder contains a fully connected feed-forward network,
-# which is applied to each position separately and identically.  This
-# consists of two linear transformations with a ReLU activation in
-# between.
-#
-# $$\mathrm{FFN}(x)=\max(0, xW_1 + b_1) W_2 + b_2$$
-#
-# While the linear transformations are the same across different
-# positions, they use different parameters from layer to
-# layer. Another way of describing this is as two convolutions with
-# kernel size 1.  The dimensionality of input and output is
-# $d_{\text{model}}=512$, and the inner-layer has dimensionality
-# $d_{ff}=2048$.
-
-# %% id="6HHCemCxTsqH"
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."
 
@@ -585,20 +332,6 @@ class PositionwiseFeedForward(nn.Module):
         return self.w_2(self.dropout(self.w_1(x).relu()))
 
 
-# %% [markdown] id="dR1YM520TsqH"
-# ## Embeddings and Softmax
-#
-# Similarly to other sequence transduction models, we use learned
-# embeddings to convert the input tokens and output tokens to vectors
-# of dimension $d_{\text{model}}$.  We also use the usual learned
-# linear transformation and softmax function to convert the decoder
-# output to predicted next-token probabilities.  In our model, we
-# share the same weight matrix between the two embedding layers and
-# the pre-softmax linear transformation, similar to
-# [(cite)](https://arxiv.org/abs/1608.05859). In the embedding layers,
-# we multiply those weights by $\sqrt{d_{\text{model}}}$.
-
-# %% id="pyrChq9qTsqH"
 class Embeddings(nn.Module):
     def __init__(self, d_model, vocab):
         super(Embeddings, self).__init__()
@@ -608,38 +341,10 @@ class Embeddings(nn.Module):
     def forward(self, x):
         return self.lut(x) * math.sqrt(self.d_model)
 
-
-# %% [markdown] id="vOkdui-cTsqH"
-# ## Positional Encoding
-#
-# Since our model contains no recurrence and no convolution, in order
-# for the model to make use of the order of the sequence, we must
-# inject some information about the relative or absolute position of
-# the tokens in the sequence.  To this end, we add "positional
-# encodings" to the input embeddings at the bottoms of the encoder and
-# decoder stacks.  The positional encodings have the same dimension
-# $d_{\text{model}}$ as the embeddings, so that the two can be summed.
-# There are many choices of positional encodings, learned and fixed
-# [(cite)](https://arxiv.org/pdf/1705.03122.pdf).
-#
-# In this work, we use sine and cosine functions of different frequencies:
 #
 # $$PE_{(pos,2i)} = \sin(pos / 10000^{2i/d_{\text{model}}})$$
 #
 # $$PE_{(pos,2i+1)} = \cos(pos / 10000^{2i/d_{\text{model}}})$$
-#
-# where $pos$ is the position and $i$ is the dimension.  That is, each
-# dimension of the positional encoding corresponds to a sinusoid.  The
-# wavelengths form a geometric progression from $2\pi$ to $10000 \cdot
-# 2\pi$.  We chose this function because we hypothesized it would
-# allow the model to easily learn to attend by relative positions,
-# since for any fixed offset $k$, $PE_{pos+k}$ can be represented as a
-# linear function of $PE_{pos}$.
-#
-# In addition, we apply dropout to the sums of the embeddings and the
-# positional encodings in both the encoder and decoder stacks.  For
-# the base model, we use a rate of $P_{drop}=0.1$.
-#
 #
 
 # %% id="zaHGD4yJTsqH"
@@ -666,13 +371,6 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-# %% [markdown] id="EfHacTJLTsqH"
-#
-# > Below the positional encoding will add in a sine wave based on
-# > position. The frequency and offset of the wave is different for
-# > each dimension.
-
-# %% id="rnvHk_1QokC6" type="example"
 def example_positional():
     pe = PositionalEncoding(20, 0)
     y = pe.forward(torch.zeros(1, 100, 20))
@@ -699,27 +397,10 @@ def example_positional():
     )
 
 
-show_example(example_positional)
 
 
-# %% [markdown] id="g8rZNCrzTsqI"
-#
-# We also experimented with using learned positional embeddings
-# [(cite)](https://arxiv.org/pdf/1705.03122.pdf) instead, and found
-# that the two versions produced nearly identical results.  We chose
-# the sinusoidal version because it may allow the model to extrapolate
-# to sequence lengths longer than the ones encountered during
-# training.
-
-# %% [markdown] id="iwNKCzlyTsqI"
-# ## Full Model
-#
-# > Here we define a function from hyperparameters to a full model.
-
-# %% id="mPe1ES0UTsqI"
 def make_model(
-    src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1
-):
+    src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
@@ -740,18 +421,6 @@ def make_model(
             nn.init.xavier_uniform_(p)
     return model
 
-
-# %% [markdown]
-# ## Inference:
-#
-# > Here we make a forward step to generate a prediction of the
-# model. We try to use our transformer to memorize the input. As you
-# will see the output is randomly generated due to the fact that the
-# model is not trained yet. In the next tutorial we will build the
-# training function and try to train our model to memorize the numbers
-# from 1 to 10.
-
-# %%
 def inference_test():
     test_model = make_model(11, 11, 2)
     test_model.eval()
@@ -780,28 +449,7 @@ def run_tests():
         inference_test()
 
 
-show_example(run_tests)
 
-
-# %% [markdown]
-# # Part 2: Model Training
-
-# %% [markdown] id="05s6oT9fTsqI"
-# # Training
-#
-# This section describes the training regime for our models.
-
-# %% [markdown] id="fTxlofs4TsqI"
-#
-# > We stop for a quick interlude to introduce some of the tools
-# > needed to train a standard encoder decoder model. First we define a
-# > batch object that holds the src and target sentences for training,
-# > as well as constructing the masks.
-
-# %% [markdown] id="G7SkCenXTsqI"
-# ## Batches and Masking
-
-# %%
 class Batch:
     """Object for holding a batch of data with mask during training."""
 
@@ -1074,13 +722,13 @@ class LabelSmoothing(nn.Module):
         # index的坐标:ind[0,0]=0,ind[0,1]=1,ind[0,2]=2,ind[0,3]=0
         
         >>> torch.zeros(3, 5, dtype=src.dtype).scatter_(0, index, src)
-        tensor([[1, 0, 0, 4, 0], # x[ind[0,0],0]=src[0,0]=1, x[ind[0,3],3]=src[0,3]=4
-                [0, 2, 0, 0, 0], # x[ind[0,1],1]=src[0,1]=2
-                [0, 0, 3, 0, 0]]) # x[ind[0,2],2] = src[0,2]=3
+        tensor([[1, 0, 0, 4, 0], # x[ind[0,0]=0,0]=src[0,0]=1, x[ind[0,3]=0,3]=src[0,3]=4
+                [0, 2, 0, 0, 0], # x[ind[0,1]=1,1]=src[0,1]=2
+                [0, 0, 3, 0, 0]]) # x[ind[0,2]=2,2] = src[0,2]=3
         
         >>> index = torch.tensor([[0, 1, 2], [0, 1, 4]]) # index的坐标:ind[0,0]=0,ind[0,1]=1,ind[0,2]=2,ind[1,0]=0,ind[1,1]=1,ind[1,2]=4
         >>> torch.zeros(3, 5, dtype=src.dtype).scatter_(1, index, src)
-        tensor([[1, 2, 3, 0, 0], # x[0,ind[0,0]]=src[0,0]=1, x[0,ind[0,1]]=src[0,1]=2,x[0,ind[0,2]=2]=src[0,2]=3
+        tensor([[1, 2, 3, 0, 0], # x[0,ind[0,0]=0]=src[0,0]=1, x[0,ind[0,1]=1]=src[0,1]=2,x[0,ind[0,2]=2]=src[0,2]=3
                 [6, 7, 0, 0, 8], # x[1,ind[1,0]=0]=src[1,0]=6, x[1,ind[1,1]=1]=src[1,1]=7,x[1,ind[1,2]=4]=src[1,2]=8,
                 [0, 0, 0, 0, 0]])        
                 
@@ -1102,12 +750,29 @@ class LabelSmoothing(nn.Module):
         x[0,1]=in[0,ind[0,1]=0]=1
         x[1,0]=in[1,ind[1,0]=1]=3
         x[1,1]=in[1,ind[1,1]=0]=4
+        
+        squeeze:
+        Returns a tensor with all specified dimensions of input of size 1 removed.如果指定 dim!=1，则什么都不做
+        
+        unsqueeze:
+        Returns a new tensor with a dimension of size one inserted at the specified position.
         """
         true_dist.scatter_(dim=1, index=target.data.unsqueeze(1), src=self.confidence) #
         true_dist[:, self.padding_idx] = 0
         mask = torch.nonzero(target.data == self.padding_idx)
         if mask.dim() > 0:
-            true_dist.index_fill_(0, mask.squeeze(), 0.0)
+            """
+            >>> x = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)
+            >>> index = torch.tensor([0, 2])
+            >>> x.index_fill_(dim=1, index=index, value=-1)
+            tensor([[-1.,  2., -1.],
+                    [-1.,  5., -1.],
+                    [-1.,  8., -1.]])
+                    
+            tensor.detach():
+            Returns a new Tensor, detached from the current graph. The result will never require gradient
+            """
+            true_dist.index_fill_(dim=0, index=mask.squeeze(), value=0.0)
         self.true_dist = true_dist
         return self.criterion(x, true_dist.clone().detach())
 
@@ -1162,7 +827,6 @@ def example_label_smoothing():
     )
 
 
-show_example(example_label_smoothing)
 
 
 # %% [markdown] id="CGM8J1veTsqK"
@@ -1200,7 +864,6 @@ def penalization_visualization():
     )
 
 
-show_example(penalization_visualization)
 
 
 # %% [markdown] id="67lUqeLXTsqK"
@@ -2023,9 +1686,6 @@ def viz_decoder_self():
 #show_example(viz_decoder_self)
 
 
-# %% [markdown]
-# ## Decoder Src Attention
-
 # %% tags=[]
 def viz_decoder_src():
     model, example_data = run_model_example(n_examples=1)
@@ -2061,4 +1721,8 @@ if __name__ == '__main__':
     #model = load_trained_model()
     #run_de_translate_to_en()
     #show_example(viz_decoder_src)
-
+    #show_example(run_tests)
+    #show_example(penalization_visualization)
+    #show_example(example_label_smoothing)
+    #show_example(example_positional)
+    #show_example(example_mask)
