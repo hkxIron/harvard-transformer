@@ -151,14 +151,14 @@ class LayerNorm(nn.Module):
         std = x.std(dim=-1, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
-class LayerNormResidual(nn.Module):
+class NormResidualDropout(nn.Module):
     """
     A residual connection followed by a layer norm.
     Note for code simplicity the norm is first as opposed to last.
     """
 
     def __init__(self, size:int, dropout:float):
-        super(LayerNormResidual, self).__init__()
+        super(NormResidualDropout, self).__init__()
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
 
@@ -183,16 +183,17 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
         self.self_attn:MultiHeadedAttention = self_attn
         self.feed_forward:PositionwiseFeedForward = feed_forward
-        self.residualLayers = clones(LayerNormResidual(size, dropout), N=2)
+        self.residualLayers = clones(NormResidualDropout(size, dropout), N=2)
         self.size = size
 
     def forward(self, x, mask):
         "Follow Figure 1 (left) for connections."
         """
-        1. multi-head attention
-        2. residual + layer norm + dropout
+        1. self attention
+        2. layer norm + residual + dropout
+        
         3. feed forward 
-        4. residual + layer norm + dropout
+        4. layer norm + residual + dropout
         """
         x = self.residualLayers[0](x, sublayer=lambda x: self.self_attn(query=x, key=x, value=x, mask=mask))
         return self.residualLayers[1](x, sublayer=self.feed_forward)
@@ -217,14 +218,24 @@ class DecoderLayer(nn.Module):
         super(DecoderLayer, self).__init__()
         self.size = size
         self.self_attn:MultiHeadedAttention = self_attn
-        self.src_attn = src_attn
+        self.src_attn:MultiHeadedAttention = src_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(LayerNormResidual(size, dropout), 3)
+        self.sublayer = clones(NormResidualDropout(size, dropout), 3)
 
     def forward(self, x, encoder_memory, src_mask, tgt_mask):
         "Follow Figure 1 (right) for connections."
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, encoder_memory, encoder_memory, src_mask))
+        """
+        1. self attention
+        2. layer norm + residual + dropout
+        
+        3. src-target cross attention
+        4. layer norm + residual + dropout
+        
+        5. feed forward 
+        6. layer norm + residual + dropout
+        """
+        x = self.sublayer[0](x, lambda x: self.self_attn(query=x, key=x, value=x, mask=tgt_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(query=x, key=encoder_memory, value=encoder_memory, mask=src_mask))
         return self.sublayer[2](x, self.feed_forward)
 
 
