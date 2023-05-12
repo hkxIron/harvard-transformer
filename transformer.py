@@ -16,6 +16,9 @@ import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
+# alt.renderers.enable('notebook')
+# alt.renderers.enable('mimetype')
+
 from torchtext.data.functional import to_map_style_dataset
 from torch.utils.data import DataLoader
 from torchtext.vocab import build_vocab_from_iterator
@@ -27,28 +30,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-
 # Set to False to skip notebook execution (e.g. for debugging)
 warnings.filterwarnings("ignore")
-RUN_EXAMPLES = True
-
-
-# %%
-# Some convenience helper functions used throughout the notebook
-
-def is_interactive_notebook():
-    return __name__ == "__main__"
-
-
-def show_example(fn, args=[]):
-    if __name__ == "__main__" and RUN_EXAMPLES:
-        return fn(*args)
-
-
-def execute_example(fn, args=[]):
-    if __name__ == "__main__" and RUN_EXAMPLES:
-        fn(*args)
-
 
 class DummyOptimizer(torch.optim.Optimizer):
     def __init__(self):
@@ -66,275 +49,11 @@ class DummyScheduler:
     def step(self):
         None
 
-class EncoderDecoder(nn.Module):
-    """
-    A standard Encoder-Decoder architecture. Base for this and many
-    other models.
-    """
-
-    def __init__(self, encoder:nn.Module, decoder:nn.Module, src_embed:nn.Module, tgt_embed:nn.Module, generator:nn.Module):
-        super(EncoderDecoder, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.generator = generator
-
-    # src_ids:[batch_size, max_in_seq_len]
-    # tgt_ids:[batch_size, max_out_seq_len]
-    # src_mask:[batch_size, max_in_seq_len]
-    # tgt_mask:[batch_size, max_out_seq_len]
-    def forward(self, src_ids, tgt_ids, src_mask, tgt_mask):
-        "Take in and process masked src and target sequences."
-        # 先encode,再decode
-        enc = self.encode(src_ids, src_mask)
-        return self.decode(enc, src_mask, tgt_ids, tgt_mask)
-
-    def encode(self, src_ids, src_mask):
-        embed = self.src_embed(src_ids)
-        return self.encoder(embed, src_mask)
-
-    def decode(self, encoder_memory, src_mask, tgt_ids, tgt_mask):
-        embed = self.tgt_embed(tgt_ids)
-        return self.decoder(embed, encoder_memory, src_mask, tgt_mask)
-
-
-class Generator(nn.Module):
-    "Define standard linear + softmax generation step."
-
-    def __init__(self, d_model:int, vocab:int):
-        super(Generator, self).__init__()
-        self.proj = nn.Linear(in_features=d_model, out_features=vocab)
-
-    # x:[batch_size, target_seq_len, d_model]
-    def forward(self, x):
-        return log_softmax(input=self.proj(x), dim=-1) #Applies a softmax followed by a logarithm
-
-
-def clones(module:nn.Module, N:int):
-    "Produce N identical layers."
-    return nn.ModuleList(modules=[copy.deepcopy(module) for _ in range(N)])
-
-class Encoder(nn.Module):
-    "Core encoder is a stack of N layers"
-
-    def __init__(self, layer:EncoderLayer, N:int=6):
-        super(Encoder, self).__init__()
-        self.layers:EncoderLayer = clones(layer, N)
-        self.norm = LayerNorm(features=layer.size)
-
-    def forward(self, x, mask):
-        "Pass the input (and mask) through each layer in turn."
-        for layer in self.layers: # 6层transformer
-            x = layer(x, mask)
-        return self.norm(x) # layer_norm
-
-
-#
-# We employ a residual connection
-# [(cite)](https://arxiv.org/abs/1512.03385) around each of the two
-# sub-layers, followed by layer normalization
-# [(cite)](https://arxiv.org/abs/1607.06450).
-
-class LayerNorm(nn.Module):
-    "Construct a layernorm module (See citation for details)."
-
-    def __init__(self, features:int, eps=1e-6):
-        super(LayerNorm, self).__init__()
-        # a_2,b_2为需要学习的参数
-        self.a_2 = nn.Parameter(torch.ones(features))
-        self.b_2 = nn.Parameter(torch.zeros(features))
-        self.eps = eps
-
-    def forward(self, x):
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
-
-class NormResidualDropout(nn.Module):
-    """
-    A residual connection followed by a layer norm.
-    Note for code simplicity the norm is first as opposed to last.
-    """
-
-    def __init__(self, size:int, dropout:float):
-        super(NormResidualDropout, self).__init__()
-        self.norm = LayerNorm(size)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, sublayer:nn.Module):
-        "Apply residual connection to any sublayer with the same size."
-        # residual layer在之前会layer_norm,之后会drop_out
-        """
-        1. layer norm
-        2. sublayer
-        3. dropout
-        4. add
-        """
-        normed = self.norm(x)
-        sub_out = sublayer(normed)
-        dropped = self.dropout(sub_out)
-        return x + dropped
-
-class EncoderLayer(nn.Module):
-    "Encoder is made up of self-attn and feed forward (defined below)"
-
-    def __init__(self, size:int, self_attn:MultiHeadedAttention, feed_forward:PositionwiseFeedForward, dropout:float):
-        super(EncoderLayer, self).__init__()
-        self.self_attn:MultiHeadedAttention = self_attn
-        self.feed_forward:PositionwiseFeedForward = feed_forward
-        self.residualLayers = clones(NormResidualDropout(size, dropout), N=2)
-        self.size = size
-
-    def forward(self, x, mask):
-        "Follow Figure 1 (left) for connections."
-        """
-        1. self attention
-        2. layer norm + residual + dropout
-        
-        3. feed forward 
-        4. layer norm + residual + dropout
-        """
-        x = self.residualLayers[0](x, sublayer=lambda x: self.self_attn(query=x, key=x, value=x, mask=mask))
-        return self.residualLayers[1](x, sublayer=self.feed_forward)
-
-class Decoder(nn.Module):
-    "Generic N layer decoder with masking."
-
-    def __init__(self, layer:DecoderLayer, N:int):
-        super(Decoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(features=layer.size)
-
-    def forward(self, x, memory, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
-        return self.norm(x)
-
-class DecoderLayer(nn.Module):
-    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
-
-    def __init__(self, size:int, self_attn:MultiHeadedAttention, src_attn:MultiHeadedAttention, feed_forward:PositionwiseFeedForward, dropout:float):
-        super(DecoderLayer, self).__init__()
-        self.size = size
-        self.self_attn:MultiHeadedAttention = self_attn
-        self.src_attn:MultiHeadedAttention = src_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(NormResidualDropout(size, dropout), 3)
-
-    def forward(self, x, encoder_memory, src_mask, tgt_mask):
-        "Follow Figure 1 (right) for connections."
-        """
-        1. self attention
-        2. layer norm + residual + dropout
-        
-        3. src-target cross attention
-        4. layer norm + residual + dropout
-        
-        5. feed forward 
-        6. layer norm + residual + dropout
-        """
-        x = self.sublayer[0](x, lambda x: self.self_attn(query=x, key=x, value=x, mask=tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(query=x, key=encoder_memory, value=encoder_memory, mask=src_mask))
-        return self.sublayer[2](x, self.feed_forward)
-
-
-# %% id="QN98O2l3TsqF"
-def subsequent_mask(size):
-    "Mask out subsequent positions."
-    attn_shape = (1, size, size)
-    subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1).type(
-        torch.uint8
-    )
-    return subsequent_mask == 0
-
-def example_mask():
-    LS_data = pd.concat(
-        [
-            pd.DataFrame(
-                {
-                    "Subsequent Mask": subsequent_mask(20)[0][x, y].flatten(),
-                    "Window": y,
-                    "Masking": x,
-                }
-            )
-            for y in range(20)
-            for x in range(20)
-        ]
-    )
-
-    return (
-        alt.Chart(LS_data)
-        .mark_rect()
-        .properties(height=250, width=250)
-        .encode(
-            alt.X("Window:O"),
-            alt.Y("Masking:O"),
-            alt.Color("Subsequent Mask:Q", scale=alt.Scale(scheme="viridis")),
-        )
-        .interactive()
-    )
-
-
-
-def attention(query, key, value, mask=None, dropout=None):
-    "Compute 'Scaled Dot Product Attention'"
-    d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    p_attn = scores.softmax(dim=-1)
-    if dropout is not None:
-        p_attn = dropout(p_attn)
-    return torch.matmul(p_attn, value), p_attn
-
-
-class MultiHeadedAttention(nn.Module):
-    def __init__(self, head_num:int, d_model:int, dropout:float=0.1):
-        "Take in model size and number of heads."
-        super(MultiHeadedAttention, self).__init__()
-        assert d_model % head_num == 0
-        # We assume d_v always equals d_k
-        self.d_k = d_model // head_num
-        self.h = head_num
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
-        self.attn = None
-        self.dropout = nn.Dropout(p=dropout)
-
-    def forward(self, query, key, value, mask=None):
-        "Implements Figure 2"
-        if mask is not None:
-            # Same mask applied to all h heads.
-            mask = mask.unsqueeze(1)
-        nbatches = query.size(0)
-
-        # 1) Do all the linear projections in batch from d_model => h x d_k
-        query, key, value = [
-            lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-            for lin, x in zip(self.linears, (query, key, value))
-        ]
-
-        # 2) Apply attention on all the projected vectors in batch.
-        x, self.attn = attention(
-            query, key, value, mask=mask, dropout=self.dropout
-        )
-
-        # 3) "Concat" using a view and apply a final linear.
-        x = (
-            x.transpose(1, 2)
-            .contiguous()
-            .view(nbatches, -1, self.h * self.d_k)
-        )
-        del query
-        del key
-        del value
-        return self.linears[-1](x)
-
-class PositionwiseFeedForward(nn.Module):
+class PositionWiseFeedForward(nn.Module):
     "Implements FFN equation."
 
     def __init__(self, d_model, d_ff, dropout=0.1):
-        super(PositionwiseFeedForward, self).__init__()
+        super(PositionWiseFeedForward, self).__init__()
         self.w_1 = nn.Linear(d_model, d_ff)
         self.w_2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -382,40 +101,267 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-def example_positional():
-    pe = PositionalEncoding(20, 0)
-    y = pe.forward(torch.zeros(1, 100, 20))
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, head_num:int, d_model:int, dropout:float=0.1):
+        "Take in model size and number of heads."
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % head_num == 0
+        # We assume d_v always equals d_k
+        self.d_k = d_model // head_num
+        self.h = head_num
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
 
-    data = pd.concat(
-        [
-            pd.DataFrame(
-                {
-                    "embedding": y[0, :, dim],
-                    "dimension": dim,
-                    "position": list(range(100)),
-                }
-            )
-            for dim in [4, 5, 6, 7]
+    def forward(self, query, key, value, mask=None):
+        "Implements Figure 2"
+        if mask is not None:
+            # Same mask applied to all h heads.
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+
+        # 1) Do all the linear projections in batch from d_model => h x d_k
+        query, key, value = [
+            lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+            for lin, x in zip(self.linears, (query, key, value))
         ]
-    )
 
-    return (
-        alt.Chart(data)
-        .mark_line()
-        .properties(width=800)
-        .encode(x="position", y="embedding", color="dimension:N")
-        .interactive()
-    )
+        # 2) Apply attention on all the projected vectors in batch.
+        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
+
+        # 3) "Concat" using a view and apply a final linear.
+        x = ( x.transpose(1, 2)
+                .contiguous()
+                .view(nbatches, -1, self.h * self.d_k)
+        )
+
+        del query
+        del key
+        del value
+        return self.linears[-1](x)
+
+class EncoderLayer(nn.Module):
+    "Encoder is made up of self-attn and feed forward (defined below)"
+
+    def __init__(self, size:int, self_attn:MultiHeadedAttention, feed_forward:PositionWiseFeedForward, dropout:float):
+        super(EncoderLayer, self).__init__()
+        self.self_attn:MultiHeadedAttention = self_attn
+        self.feed_forward:PositionWiseFeedForward = feed_forward
+        self.residualLayers = clones(NormResidualDropout(size, dropout), N=2)
+        self.size = size
+
+    def forward(self, x, mask):
+        "Follow Figure 1 (left) for connections."
+        """
+        1. self attention
+        2. layer norm + residual + dropout
+        
+        3. feed forward 
+        4. layer norm + residual + dropout
+        """
+        x = self.residualLayers[0](x, sublayer=lambda x: self.self_attn(query=x, key=x, value=x, mask=mask))
+        x = self.residualLayers[1](x, sublayer=self.feed_forward)
+        return x
+
+class Generator(nn.Module):
+    "Define standard linear + softmax generation step."
+
+    def __init__(self, d_model:int, vocab:int):
+        super(Generator, self).__init__()
+        self.proj = nn.Linear(in_features=d_model, out_features=vocab)
+
+    # x:[batch_size, target_seq_len, d_model]
+    def forward(self, x):
+        return log_softmax(input=self.proj(x), dim=-1) #Applies a softmax followed by a logarithm
 
 
+def clones(module:nn.Module, N:int):
+    "Produce N identical layers."
+    return nn.ModuleList(modules=[copy.deepcopy(module) for _ in range(N)])
+
+class Encoder(nn.Module):
+    "Core encoder is a stack of N layers"
+
+    def __init__(self, layer:EncoderLayer, N:int=6):
+        super(Encoder, self).__init__()
+        self.layers:EncoderLayer = clones(layer, N)
+        self.norm = LayerNorm(features=layer.size)
+
+    def forward(self, x, mask):
+        "Pass the input (and mask) through each layer in turn."
+        for layer in self.layers: # 6层transformer
+            x = layer(x, mask)
+        return self.norm(x) # layer_norm
+
+#
+# We employ a residual connection
+# [(cite)](https://arxiv.org/abs/1512.03385) around each of the two
+# sub-layers, followed by layer normalization
+# [(cite)](https://arxiv.org/abs/1607.06450).
+
+class LayerNorm(nn.Module):
+    "Construct a layernorm module (See citation for details)."
+
+    def __init__(self, features:int, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        # a_2,b_2为需要学习的参数
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+class NormResidualDropout(nn.Module):
+    """
+    A residual connection followed by a layer norm.
+    Note for code simplicity the norm is first as opposed to last.
+    """
+
+    def __init__(self, size:int, dropout:float):
+        super(NormResidualDropout, self).__init__()
+        self.norm = LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer:nn.Module):
+        "Apply residual connection to any sublayer with the same size."
+        # residual layer在之前会layer_norm,之后会drop_out
+        """
+        1. layer norm
+        2. sublayer
+        3. dropout
+        4. add
+        """
+        normed = self.norm(x)
+        sub_out = sublayer(normed)
+        dropped = self.dropout(sub_out)
+        return x + dropped
+
+class DecoderLayer(nn.Module):
+    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
+
+    def __init__(self, size:int, self_attn:MultiHeadedAttention, src_attn:MultiHeadedAttention, feed_forward:PositionWiseFeedForward, dropout:float):
+        super(DecoderLayer, self).__init__()
+        self.size = size
+        self.self_attn:MultiHeadedAttention = self_attn
+        self.src_attn:MultiHeadedAttention = src_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(NormResidualDropout(size, dropout), 3)
+
+    def forward(self, x, encoder_memory, src_mask, tgt_mask):
+        "Follow Figure 1 (right) for connections."
+        """
+        1. self attention
+        2. layer norm + residual + dropout
+        
+        3. src-target cross attention
+        4. layer norm + residual + dropout
+        
+        5. feed forward 
+        6. layer norm + residual + dropout
+        """
+        x = self.sublayer[0](x, lambda x: self.self_attn(query=x, key=x, value=x, mask=tgt_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(query=x, key=encoder_memory, value=encoder_memory, mask=src_mask))
+        x = self.sublayer[2](x, self.feed_forward)
+        return x
+
+class Decoder(nn.Module):
+    "Generic N layer decoder with masking."
+
+    def __init__(self, layer:DecoderLayer, N:int):
+        super(Decoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(features=layer.size)
+
+    def forward(self, x, memory, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, memory, src_mask, tgt_mask)
+        return self.norm(x)
+
+class EncoderDecoder(nn.Module):
+    """
+    A standard Encoder-Decoder architecture. Base for this and many
+    other models.
+    """
+
+    def __init__(self, encoder:EncoderLayer, decoder:DecoderLayer, src_embed:Embeddings, tgt_embed:Embeddings, generator:Generator):
+        super(EncoderDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.tgt_embed = tgt_embed
+        self.generator = generator
+
+    # src_ids:[batch_size, max_in_seq_len]
+    # tgt_ids:[batch_size, max_out_seq_len]
+    # src_mask:[batch_size, max_in_seq_len]
+    # tgt_mask:[batch_size, max_out_seq_len]
+    def forward(self, src_ids, tgt_ids, src_mask, tgt_mask):
+        "Take in and process masked src and target sequences."
+        # 先encode,再decode
+        enc = self.encode(src_ids, src_mask)
+        return self.decode(enc, src_mask, tgt_ids, tgt_mask)
+
+    def encode(self, src_ids, src_mask):
+        embed = self.src_embed(src_ids)
+        return self.encoder(embed, src_mask)
+
+    def decode(self, encoder_memory, src_mask, tgt_ids, tgt_mask):
+        embed = self.tgt_embed(tgt_ids)
+        return self.decoder(embed, encoder_memory, src_mask, tgt_mask)
+
+def subsequent_mask(size:int):
+    "Mask out subsequent positions."
+    """
+    >>> a = torch.randn(3, 3)
+    >>> a
+    tensor([[ 0.2309,  0.5207,  2.0049],
+            [ 0.2072, -1.0680,  0.6602],
+            [ 0.3480, -0.5211, -0.4573]])
+    >>> torch.triu(a, diagonal=1)
+    tensor([[ 0.0000,  0.5207,  2.0049],
+            [ 0.0000,  0.0000,  0.6602],
+            [ 0.0000,  0.0000,  0.0000]])
+    """
+    attn_shape = (1, size, size)
+    subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1).type(torch.uint8) # 只保留上三角矩阵元素
+    return subsequent_mask == 0 # 只取下三角矩阵
+
+"""
+query:[batch, seq_len, d_model]
+key:[batch, seq_len, d_model]
+value:[batch, seq_len, d_model]
+mask:[1, seq_len, seq_len]
+
+:return
+    attn_value: [batch, seq_len, d_model]
+    p_attn: [batch, seq_len, seq_len]
+"""
+def attention(query, key, value, mask=None, dropout=None):
+    "Compute 'Scaled Dot Product Attention'"
+    d_model = query.size(-1)
+    # 之所以除以d_model,因为如果key,query方差为1,均值为0, 则query@key之后，其方差为d_model
+    # scores:[batch, seq_len, seq_len]
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_model)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, -1e9) # 直接给一个非常大的负数，以至于在softmax输出为会0分
+
+    # p_attn:[batch, seq_len, seq_len]
+    p_attn = scores.softmax(dim=-1)
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+    # attn_value:[batch, seq_len, d_model]
+    attn_value = torch.matmul(p_attn, value)
+    return attn_value, p_attn
 
 
-def make_model(
-    src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
+def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
-    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    ff = PositionWiseFeedForward(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
     model = EncoderDecoder(
         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
@@ -431,34 +377,6 @@ def make_model(
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
     return model
-
-def inference_test():
-    test_model = make_model(11, 11, 2)
-    test_model.eval()
-    src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
-    src_mask = torch.ones(1, 1, 10)
-
-    memory = test_model.encode(src, src_mask)
-    ys = torch.zeros(1, 1).type_as(src)
-
-    for i in range(9):
-        out = test_model.decode(
-            memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data)
-        )
-        prob = test_model.generator(out[:, -1])
-        _, next_word = torch.max(prob, dim=1)
-        next_word = next_word.data[0]
-        ys = torch.cat(
-            [ys, torch.empty(1, 1).type_as(src.data).fill_(next_word)], dim=1
-        )
-
-    print("Example Untrained Model Prediction:", ys)
-
-
-def run_tests():
-    for _ in range(10):
-        inference_test()
-
 
 
 class Batch:
@@ -483,16 +401,9 @@ class Batch:
         return tgt_mask
 
 
-# %% [markdown] id="cKkw5GjLTsqI"
-#
 # > Next we create a generic training and scoring function to keep
 # > track of loss. We pass in a generic loss compute function that
 # > also handles parameter updates.
-
-# %% [markdown] id="Q8zzeUc0TsqJ"
-# ## Training Loop
-
-# %%
 class TrainState:
     """Track number of steps, examples, and tokens processed"""
 
@@ -557,61 +468,6 @@ def run_epoch(
     return total_loss / total_tokens, train_state
 
 
-# %% [markdown] id="aB1IF0foTsqJ"
-# ## Training Data and Batching
-#
-# We trained on the standard WMT 2014 English-German dataset
-# consisting of about 4.5 million sentence pairs.  Sentences were
-# encoded using byte-pair encoding, which has a shared source-target
-# vocabulary of about 37000 tokens. For English-French, we used the
-# significantly larger WMT 2014 English-French dataset consisting of
-# 36M sentences and split tokens into a 32000 word-piece vocabulary.
-#
-#
-# Sentence pairs were batched together by approximate sequence length.
-# Each training batch contained a set of sentence pairs containing
-# approximately 25000 source tokens and 25000 target tokens.
-
-# %% [markdown] id="F1mTQatiTsqJ" jp-MarkdownHeadingCollapsed=true tags=[]
-# ## Hardware and Schedule
-#
-# We trained our models on one machine with 8 NVIDIA P100 GPUs.  For
-# our base models using the hyperparameters described throughout the
-# paper, each training step took about 0.4 seconds.  We trained the
-# base models for a total of 100,000 steps or 12 hours. For our big
-# models, step time was 1.0 seconds.  The big models were trained for
-# 300,000 steps (3.5 days).
-
-# %% [markdown] id="-utZeuGcTsqJ"
-# ## Optimizer
-#
-# We used the Adam optimizer [(cite)](https://arxiv.org/abs/1412.6980)
-# with $\beta_1=0.9$, $\beta_2=0.98$ and $\epsilon=10^{-9}$.  We
-# varied the learning rate over the course of training, according to
-# the formula:
-#
-# $$
-# lrate = d_{\text{model}}^{-0.5} \cdot
-#   \min({step\_num}^{-0.5},
-#     {step\_num} \cdot {warmup\_steps}^{-1.5})
-# $$
-#
-# This corresponds to increasing the learning rate linearly for the
-# first $warmup\_steps$ training steps, and decreasing it thereafter
-# proportionally to the inverse square root of the step number.  We
-# used $warmup\_steps=4000$.
-
-# %% [markdown] id="39FbYnt-TsqJ"
-#
-# > Note: This part is very important. Need to train with this setup
-# > of the model.
-
-# %% [markdown] id="hlbojFkjTsqJ"
-#
-# > Example of the curves of this model for different model sizes and
-# > for optimization hyperparameters.
-
-# %% id="zUz3PdAnVg4o"
 def rate(step, model_size, factor, warmup):
     """
     we have to default the step to 1 for LambdaLR function
@@ -619,89 +475,9 @@ def rate(step, model_size, factor, warmup):
     """
     if step == 0:
         step = 1
-    return factor * (
-        model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5))
-    )
+    return factor * ( model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5)) )
 
 
-# %% id="l1bnrlnSV8J5" tags=[]
-def example_learning_schedule():
-    opts = [
-        [512, 1, 4000],  # example 1
-        [512, 1, 8000],  # example 2
-        [256, 1, 4000],  # example 3
-    ]
-
-    dummy_model = torch.nn.Linear(1, 1)
-    learning_rates = []
-
-    # we have 3 examples in opts list.
-    for idx, example in enumerate(opts):
-        # run 20000 epoch for each example
-        optimizer = torch.optim.Adam(
-            dummy_model.parameters(), lr=1, betas=(0.9, 0.98), eps=1e-9
-        )
-        lr_scheduler = LambdaLR(
-            optimizer=optimizer, lr_lambda=lambda step: rate(step, *example)
-        )
-        tmp = []
-        # take 20K dummy training steps, save the learning rate at each step
-        for step in range(20000):
-            tmp.append(optimizer.param_groups[0]["lr"])
-            optimizer.step()
-            lr_scheduler.step()
-        learning_rates.append(tmp)
-
-    learning_rates = torch.tensor(learning_rates)
-
-    # Enable altair to handle more than 5000 rows
-    alt.data_transformers.disable_max_rows()
-
-    opts_data = pd.concat(
-        [
-            pd.DataFrame(
-                {
-                    "Learning Rate": learning_rates[warmup_idx, :],
-                    "model_size:warmup": ["512:4000", "512:8000", "256:4000"][
-                        warmup_idx
-                    ],
-                    "step": range(20000),
-                }
-            )
-            for warmup_idx in [0, 1, 2]
-        ]
-    )
-
-    return (
-        alt.Chart(opts_data)
-        .mark_line()
-        .properties(width=600)
-        .encode(x="step", y="Learning Rate", color="model_size:warmup:N")
-        .interactive()
-    )
-
-
-example_learning_schedule()
-
-
-# %% [markdown] id="7T1uD15VTsqK"
-# ## Regularization
-#
-# ### Label Smoothing
-#
-# During training, we employed label smoothing of value
-# $\epsilon_{ls}=0.1$ [(cite)](https://arxiv.org/abs/1512.00567).
-# This hurts perplexity, as the model learns to be more unsure, but
-# improves accuracy and BLEU score.
-
-# %% [markdown] id="kNoAVD8bTsqK"
-#
-# > We implement label smoothing using the KL div loss. Instead of
-# > using a one-hot target distribution, we create a distribution that
-# > has `confidence` of the correct word and the rest of the
-# > `smoothing` mass distributed throughout the vocabulary.
-
-# %% id="shU2GyiETsqK"
 class LabelSmoothing(nn.Module):
     "Implement label smoothing."
 
@@ -768,7 +544,7 @@ class LabelSmoothing(nn.Module):
         unsqueeze:
         Returns a new tensor with a dimension of size one inserted at the specified position.
         """
-        true_dist.scatter_(dim=1, index=target.data.unsqueeze(1), src=self.confidence) #
+        true_dist.scatter_(dim=1, index=target.data.unsqueeze(1), value=self.confidence) #
         true_dist[:, self.padding_idx] = 0
         mask = torch.nonzero(target.data == self.padding_idx)
         if mask.dim() > 0:
@@ -787,107 +563,12 @@ class LabelSmoothing(nn.Module):
         self.true_dist = true_dist
         return self.criterion(x, true_dist.clone().detach())
 
-
-# %% [markdown] id="jCxUrlUyTsqK"
-#
-# > Here we can see an example of how the mass is distributed to the
-# > words based on confidence.
-
-# %% id="EZtKaaQNTsqK"
-# Example of label smoothing.
-
-
-def example_label_smoothing():
-    crit = LabelSmoothing(5, 0, 0.4)
-    predict = torch.FloatTensor(
-        [
-            [0, 0.2, 0.7, 0.1, 0],
-            [0, 0.2, 0.7, 0.1, 0],
-            [0, 0.2, 0.7, 0.1, 0],
-            [0, 0.2, 0.7, 0.1, 0],
-            [0, 0.2, 0.7, 0.1, 0],
-        ]
-    )
-    crit(x=predict.log(), target=torch.LongTensor([2, 1, 0, 3, 3]))
-    LS_data = pd.concat(
-        [
-            pd.DataFrame(
-                {
-                    "target distribution": crit.true_dist[x, y].flatten(),
-                    "columns": y,
-                    "rows": x,
-                }
-            )
-            for y in range(5)
-            for x in range(5)
-        ]
-    )
-
-    return (
-        alt.Chart(LS_data)
-        .mark_rect(color="Blue", opacity=1)
-        .properties(height=200, width=200)
-        .encode(
-            alt.X("columns:O", title=None),
-            alt.Y("rows:O", title=None),
-            alt.Color(
-                "target distribution:Q", scale=alt.Scale(scheme="viridis")
-            ),
-        )
-        .interactive()
-    )
-
-
-
-
-# %% [markdown] id="CGM8J1veTsqK"
-#
-# > Label smoothing actually starts to penalize the model if it gets
-# > very confident about a given choice.
-
-# %% id="78EHzLP7TsqK"
-
-
 def loss(x, crit):
     d = x + 3 * 1
     predict = torch.FloatTensor([[0, x / d, 1 / d, 1 / d, 1 / d]])
     return crit(predict.log(), torch.LongTensor([1])).data
 
 
-def penalization_visualization():
-    crit = LabelSmoothing(5, 0, 0.1)
-    loss_data = pd.DataFrame(
-        {
-            "Loss": [loss(x, crit) for x in range(1, 100)],
-            "Steps": list(range(99)),
-        }
-    ).astype("float")
-
-    return (
-        alt.Chart(loss_data)
-        .mark_line()
-        .properties(width=350)
-        .encode(
-            x="Steps",
-            y="Loss",
-        )
-        .interactive()
-    )
-
-
-
-
-# %% [markdown] id="67lUqeLXTsqK"
-# # A First  Example
-#
-# > We can begin by trying out a simple copy-task. Given a random set
-# > of input symbols from a small vocabulary, the goal is to generate
-# > back those same symbols.
-
-# %% [markdown] id="jJa-89_pTsqK"
-# ## Synthetic Data
-
-# %% id="g1aTxeqqTsqK"
 def data_gen(V, batch_size, nbatches):
     "Generate random data for a src-tgt copy task."
     for i in range(nbatches):
@@ -898,10 +579,6 @@ def data_gen(V, batch_size, nbatches):
         yield Batch(src, tgt, 0)
 
 
-# %% [markdown] id="XTXwD9hUTsqK"
-# ## Loss Computation
-
-# %% id="3J8EJm87TsqK"
 class SimpleLossCompute:
     "A simple loss compute and train function."
 
@@ -920,10 +597,6 @@ class SimpleLossCompute:
         return sloss.data * norm, sloss
 
 
-# %% [markdown] id="eDAI7ELUTsqL"
-# ## Greedy Decoding
-
-# %% [markdown] id="LFkWakplTsqL" tags=[]
 # > This code predicts a translation using greedy decoding for simplicity.
 # %% id="N2UOpnT3bIyU"
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
@@ -942,65 +615,6 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
     return ys
 
 
-# %% id="qgIZ2yEtdYwe" tags=[]
-# Train the simple copy task.
-
-
-def example_simple_model():
-    V = 11
-    criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
-    model = make_model(V, V, N=2)
-
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
-    )
-    lr_scheduler = LambdaLR(
-        optimizer=optimizer,
-        lr_lambda=lambda step: rate(
-            step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400
-        ),
-    )
-
-    batch_size = 80
-    for epoch in range(20):
-        model.train()
-        run_epoch(
-            data_gen(V, batch_size, 20),
-            model,
-            SimpleLossCompute(model.generator, criterion),
-            optimizer,
-            lr_scheduler,
-            mode="train",
-        )
-        model.eval()
-        run_epoch(
-            data_gen(V, batch_size, 5),
-            model,
-            SimpleLossCompute(model.generator, criterion),
-            DummyOptimizer(),
-            DummyScheduler(),
-            mode="eval",
-        )[0]
-
-    model.eval()
-    src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
-    max_len = src.shape[1]
-    src_mask = torch.ones(1, 1, max_len)
-    print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0))
-
-
-
-
-# %% [markdown] id="OpuQv2GsTsqL"
-# # Part 3: A Real World Example
-#
-# > Now we consider a real-world example using the Multi30k
-# > German-English Translation task. This task is much smaller than
-# > the WMT task considered in the paper, but it illustrates the whole
-# > system. We also show how to use multi-gpu processing to make it
-# > really fast.
-
-# %% [markdown] id="8y9dpfolTsqL" tags=[]
 # ## Data Loading
 #
 # > We will load the dataset using torchtext and spacy for
@@ -1009,7 +623,6 @@ def example_simple_model():
 # %%
 # Load spacy tokenizer models, download them if they haven't been
 # downloaded already
-
 
 def load_tokenizers():
     import spacy
@@ -1036,9 +649,6 @@ def tokenize(text, tokenizer):
 def yield_tokens(data_iter, tokenizer, index):
     for from_to_tuple in data_iter:
         yield tokenizer(from_to_tuple[index])
-
-
-# %% id="jU3kVlV5okC-" tags=[]
 
 
 def build_vocabulary(spacy_de, spacy_en):
@@ -1082,20 +692,6 @@ def load_vocab(spacy_de, spacy_en):
     return vocab_src, vocab_tgt
 
 
-
-
-# %% [markdown] id="-l-TFwzfTsqL"
-#
-# > Batching matters a ton for speed. We want to have very evenly
-# > divided batches, with absolutely minimal padding. To do this we
-# > have to hack a bit around the default torchtext batching. This
-# > code patches their default batching to make sure we search over
-# > enough sentences to find tight batches.
-
-# %% [markdown] id="kDEj-hCgokC-" tags=[] jp-MarkdownHeadingCollapsed=true
-# ## Iterators
-
-# %% id="wGsIHFgOokC_" tags=[]
 def collate_batch(
     batch,
     src_pipeline,
@@ -1158,7 +754,6 @@ def collate_batch(
     return (src, tgt)
 
 
-# %% id="ka2Ce_WIokC_" tags=[]
 def create_dataloaders(
     device,
     vocab_src,
@@ -1188,9 +783,7 @@ def create_dataloaders(
             pad_id=vocab_src.get_stoi()["<blank>"],
         )
 
-    train_iter, valid_iter, test_iter = datasets.Multi30k(
-        language_pair=("de", "en")
-    )
+    train_iter, valid_iter, test_iter = datasets.Multi30k( language_pair=("de", "en") )
 
     train_iter_map = to_map_style_dataset(
         train_iter
@@ -1366,66 +959,10 @@ def load_trained_model():
     model.load_state_dict(torch.load("multi30k_model_final.pt"))
     return model
 
+# if False:
+#     model.src_embed[0].lut.weight = model.tgt_embeddings[0].lut.weight
+#     model.generator.lut.weight = model.tgt_embed[0].lut.weight
 
-
-
-# %% [markdown] id="RZK_VjDPTsqN"
-#
-# > Once trained we can decode the model to produce a set of
-# > translations. Here we simply translate the first sentence in the
-# > validation set. This dataset is pretty small so the translations
-# > with greedy search are reasonably accurate.
-
-# %% [markdown] id="L50i0iEXTsqN"
-# # Additional Components: BPE, Search, Averaging
-
-# %% [markdown] id="NBx1C2_NTsqN"
-#
-# > So this mostly covers the transformer model itself. There are four
-# > aspects that we didn't cover explicitly. We also have all these
-# > additional features implemented in
-# > [OpenNMT-py](https://github.com/opennmt/opennmt-py).
-#
-#
-
-# %% [markdown] id="UpqV1mWnTsqN"
-#
-# > 1) BPE/ Word-piece: We can use a library to first preprocess the
-# > data into subword units. See Rico Sennrich's
-# > [subword-nmt](https://github.com/rsennrich/subword-nmt)
-# > implementation. These models will transform the training data to
-# > look like this:
-
-# %% [markdown] id="hwJ_9J0BTsqN"
-# ▁Die ▁Protokoll datei ▁kann ▁ heimlich ▁per ▁E - Mail ▁oder ▁FTP
-# ▁an ▁einen ▁bestimmte n ▁Empfänger ▁gesendet ▁werden .
-
-# %% [markdown] id="9HwejYkpTsqN"
-#
-# > 2) Shared Embeddings: When using BPE with shared vocabulary we can
-# > share the same weight vectors between the source / target /
-# > generator. See the [(cite)](https://arxiv.org/abs/1608.05859) for
-# > details. To add this to the model simply do this:
-
-# %% id="tb3j3CYLTsqN" tags=[]
-if False:
-    model.src_embed[0].lut.weight = model.tgt_embeddings[0].lut.weight
-    model.generator.lut.weight = model.tgt_embed[0].lut.weight
-
-
-# %% [markdown] id="xDKJsSwRTsqN"
-#
-# > 3) Beam Search: This is a bit too complicated to cover here. See the
-# > [OpenNMT-py](https://github.com/OpenNMT/OpenNMT-py/)
-# > for a pytorch implementation.
-# >
-#
-
-# %% [markdown] id="wf3vVYGZTsqN"
-#
-# > 4) Model Averaging: The paper averages the last k checkpoints to
-# > create an ensembling effect. We can do this after the fact if we
-# > have a bunch of models:
 
 # %% id="hAFEa78JokDB"
 def average(model, models):
@@ -1434,38 +971,7 @@ def average(model, models):
         ps[0].copy_(torch.sum(*ps[1:]) / len(ps[1:]))
 
 
-# %% [markdown] id="Kz5BYJ9sTsqO"
-# # Results
-#
-# On the WMT 2014 English-to-German translation task, the big
-# transformer model (Transformer (big) in Table 2) outperforms the
-# best previously reported models (including ensembles) by more than
-# 2.0 BLEU, establishing a new state-of-the-art BLEU score of
-# 28.4. The configuration of this model is listed in the bottom line
-# of Table 3. Training took 3.5 days on 8 P100 GPUs. Even our base
-# model surpasses all previously published models and ensembles, at a
-# fraction of the training cost of any of the competitive models.
-#
-# On the WMT 2014 English-to-French translation task, our big model
-# achieves a BLEU score of 41.0, outperforming all of the previously
-# published single models, at less than 1/4 the training cost of the
-# previous state-of-the-art model. The Transformer (big) model trained
-# for English-to-French used dropout rate Pdrop = 0.1, instead of 0.3.
-#
-
-# %% [markdown]
-# ![](images/results.png)
-
-# %% [markdown] id="cPcnsHvQTsqO"
-#
-#
-# > With the addtional extensions in the last section, the OpenNMT-py
-# > replication gets to 26.9 on EN-DE WMT. Here I have loaded in those
-# > parameters to our reimplemenation.
-
-# %%
 # Load data and model for output checks
-
 
 # %%
 def check_outputs(
@@ -1510,33 +1016,6 @@ def check_outputs(
         results[idx] = (rb, src_tokens, tgt_tokens, model_out, model_txt)
     return results
 
-
-def run_model_example(n_examples=5):
-    global vocab_src, vocab_tgt, spacy_de, spacy_en
-
-    print("Preparing Data ...")
-    _, valid_dataloader = create_dataloaders(
-        torch.device("cpu"),
-        vocab_src,
-        vocab_tgt,
-        spacy_de,
-        spacy_en,
-        batch_size=1,
-        is_distributed=False,
-    )
-
-    print("Loading Trained Model ...")
-
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
-    model.load_state_dict(
-        torch.load("multi30k_model_final.pt", map_location=torch.device("cpu"))
-    )
-
-    print("Checking Model Outputs:")
-    example_data = check_outputs(
-        valid_dataloader, model, vocab_src, vocab_tgt, n_examples=n_examples
-    )
-    return model, example_data
 
 
 # execute_example(run_model_example)
@@ -1635,105 +1114,3 @@ def visualize_layer(model, layer, getter_fn, ntokens, row_tokens, col_tokens):
         # layer + 1 due to 0-indexing
     ).properties(title="Layer %d" % (layer + 1))
 
-
-# %% [markdown]
-# ## Encoder Self Attention
-
-# %% tags=[]
-def viz_encoder_self():
-    model, example_data = run_model_example(n_examples=1)
-    example = example_data[
-        len(example_data) - 1
-    ]  # batch object for the final example
-
-    layer_viz = [
-        visualize_layer(
-            model, layer, get_encoder, len(example[1]), example[1], example[1]
-        )
-        for layer in range(6)
-    ]
-    return alt.hconcat(
-        layer_viz[0]
-        # & layer_viz[1]
-        & layer_viz[2]
-        # & layer_viz[3]
-        & layer_viz[4]
-        # & layer_viz[5]
-    )
-
-
-#show_example(viz_encoder_self)
-
-
-# %% [markdown]
-# ## Decoder Self Attention
-
-# %% tags=[]
-def viz_decoder_self():
-    model, example_data = run_model_example(n_examples=1)
-    example = example_data[len(example_data) - 1]
-
-    layer_viz = [
-        visualize_layer(
-            model,
-            layer,
-            get_decoder_self,
-            len(example[1]),
-            example[1],
-            example[1],
-        )
-        for layer in range(6)
-    ]
-    return alt.hconcat(
-        layer_viz[0]
-        & layer_viz[1]
-        & layer_viz[2]
-        & layer_viz[3]
-        & layer_viz[4]
-        & layer_viz[5]
-    )
-
-
-#show_example(viz_decoder_self)
-
-
-# %% tags=[]
-def viz_decoder_src():
-    model, example_data = run_model_example(n_examples=1)
-    example = example_data[len(example_data) - 1]
-
-    layer_viz = [
-        visualize_layer(
-            model,
-            layer,
-            get_decoder_src,
-            max(len(example[1]), len(example[2])),
-            example[1],
-            example[2],
-        )
-        for layer in range(6)
-    ]
-    return alt.hconcat(
-        layer_viz[0]
-        & layer_viz[1]
-        & layer_viz[2]
-        & layer_viz[3]
-        & layer_viz[4]
-        & layer_viz[5]
-    )
-
-def run_de_translate_to_en():
-    # global variables used later in the script
-    spacy_de, spacy_en = show_example(load_tokenizers)
-    vocab_src, vocab_tgt = show_example(load_vocab, args=[spacy_de, spacy_en])
-
-if __name__ == '__main__':
-    execute_example(example_simple_model)
-    #model = load_trained_model()
-    #run_de_translate_to_en()
-    #show_example(viz_decoder_src)
-    #show_example(run_tests)
-    #show_example(penalization_visualization)
-    #show_example(example_label_smoothing)
-    #show_example(example_positional)
-    #show_example(example_mask)
