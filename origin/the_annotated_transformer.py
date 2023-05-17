@@ -579,8 +579,8 @@ def attention(query, key, value, mask=None, dropout=None):
 # \mathbb{R}^{d_{\text{model}} \times d_v}$ and $W^O \in
 # \mathbb{R}^{hd_v \times d_{\text{model}}}$.
 #
-# In this work we employ $h=8$ parallel attention layers, or
-# heads. For each of these we use $d_k=d_v=d_{\text{model}}/h=64$. Due
+# In this work we employ $head_num=8$ parallel attention layers, or
+# heads. For each of these we use $d_k=d_v=d_{\text{model}}/head_num=64$. Due
 # to the reduced dimension of each head, the total computational cost
 # is similar to that of single-head attention with full
 # dimensionality.
@@ -601,11 +601,11 @@ class MultiHeadedAttention(nn.Module):
     def forward(self, query, key, value, mask=None):
         "Implements Figure 2"
         if mask is not None:
-            # Same mask applied to all h heads.
+            # Same mask applied to all head_num heads.
             mask = mask.unsqueeze(1)
         nbatches = query.size(0)
 
-        # 1) Do all the linear projections in batch from d_model => h x d_k
+        # 1) Do all the linear projections in batch from d_model => head_num x d_k
         query, key, value = [
             lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
             for lin, x in zip(self.linears, (query, key, value))
@@ -1711,7 +1711,7 @@ def train_worker(
 
 # %% tags=[]
 def train_distributed_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config):
-    from the_annotated_transformer import train_worker
+    from origin.the_annotated_transformer import train_worker
 
     ngpus = torch.cuda.device_count()
     os.environ["MASTER_ADDR"] = "localhost"

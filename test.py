@@ -43,6 +43,23 @@ def execute_example(fn, args=[]):
     if __name__ == "__main__" and RUN_EXAMPLES:
         fn(*args)
 
+def loss(x, crit):
+    d = x + 3 * 1
+    predict = torch.FloatTensor([[0, x / d, 1 / d, 1 / d, 1 / d]])
+    return crit(predict.log(), torch.LongTensor([1])).data
+
+
+def data_gen(V, batch_size, nbatches):
+    "Generate random data for a src-tgt copy task."
+    seq_len = 10
+    for i in range(nbatches):
+        data = torch.randint(low=1, high=V, size=(batch_size, seq_len)) # 生成的值在[1, v-1]之间
+        data[:, 0] = 1 # 第0位为EOS=1, PAD = 0
+        # src:[batch,seq_len]
+        src = data.requires_grad_(False).clone().detach() # detach就是不需要梯度
+        # tgt:[batch,seq_len]
+        tgt = data.requires_grad_(False).clone().detach()
+        yield Batch(src, tgt, pad=0)
 
 def example_mask():
     LS_data = pd.concat(
@@ -58,11 +75,16 @@ def example_mask():
             for x in range(20)
         ]
     )
+    print(LS_data.shape)
+    print(LS_data.head())
 
     """
     import matplotlib.pyplot as plt
     plt.figure(figsize=(5,5))
     plt.imshow(subsequent_mask(20)[0])
+    
+    user guide: 
+    https://altair-viz.github.io/user_guide/generated/channels/altair.Color.html#altair.Color
     """
     chart = alt.Chart(LS_data).mark_rect().properties(height=250, width=250).encode(
         alt.X("Window:O"),
@@ -70,7 +92,7 @@ def example_mask():
         alt.Color("Subsequent Mask:Q", scale=alt.Scale(scheme="viridis")),
     ).interactive()
 
-    chart.save("mask.html")
+    chart.save("data/mask.html")
     return chart
 
 def example_positional():
@@ -247,34 +269,34 @@ def penalization_visualization():
 
 # Train the simple copy task.
 def example_simple_model():
-    V = 11
-    criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
-    model = make_model(V, V, N=2)
+    vocab_size = 10 + 1
+    criterion = LabelSmoothing(size=vocab_size, padding_idx=0, smoothing=0.0)
+    model = make_model(src_vocab=vocab_size, tgt_vocab=vocab_size, N=2)
 
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9)
+    # 用来自定义学习率
     lr_scheduler = LambdaLR(
         optimizer=optimizer,
-        lr_lambda=lambda step: rate(
-            step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400
-        ),
-    )
+        lr_lambda=lambda step: rate(step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400),)
 
     batch_size = 80
     for epoch in range(20):
+        # Sets the module in training mode.其中dropout有影响,在train时需要1/p
         model.train()
+        #batch_data=data_gen(V, batch_size, 20),
+        # train
         run_epoch(
-            data_gen(V, batch_size, 20),
+            data_gen(vocab_size, batch_size, 20),
             model,
             SimpleLossCompute(model.generator, criterion),
             optimizer,
             lr_scheduler,
             mode="train",
         )
-        model.eval()
+        # eval
+        model.eval() # set test mode
         run_epoch(
-            data_gen(V, batch_size, 5),
+            data_gen(vocab_size, batch_size, 5),
             model,
             SimpleLossCompute(model.generator, criterion),
             DummyOptimizer(),
@@ -282,7 +304,7 @@ def example_simple_model():
             mode="eval",
         )[0]
 
-    model.eval()
+    model.eval() # set test mode
     src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
     max_len = src.shape[1]
     src_mask = torch.ones(1, 1, max_len)
@@ -402,8 +424,8 @@ def run_de_translate_to_en():
 
 
 if __name__ == '__main__':
-    example_mask()
-    # execute_example(example_simple_model)
+    #example_mask()
+    execute_example(example_simple_model)
     # example_learning_schedule()
     # model = load_trained_model()
     # run_de_translate_to_en()
