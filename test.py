@@ -27,7 +27,7 @@ RUN_EXAMPLES = True
 
 # %%
 # Some convenience helper functions used throughout the notebook
-from transformer import *
+from my_transformer import *
 
 
 def is_interactive_notebook():
@@ -283,7 +283,6 @@ def example_simple_model():
     for epoch in range(20):
         # Sets the module in training mode.其中dropout有影响,在train时需要1/p
         model.train()
-        #batch_data=data_gen(V, batch_size, 20),
         # train
         run_epoch(
             data_gen(vocab_size, batch_size, 20),
