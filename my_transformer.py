@@ -16,6 +16,7 @@ import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
+from torch._tensor import Tensor
 # alt.renderers.enable('notebook')
 # alt.renderers.enable('mimetype')
 
@@ -224,9 +225,8 @@ class Generator(nn.Module):
     # x:[batch_size, seq_len-1, d_model]
     def forward(self, x):
         # out:[batch_size, seq_len-1, vocab]
-        out = log_softmax(input=self.proj(x), dim=-1) #Applies a softmax followed by a logarithm
+        out = log_softmax(input=self.proj(x), dim=-1) # 即: log(softmax(x)), 为了计算稳定性
         return out
-
 
 def clones(module:nn.Module, N:int):
     "Produce N identical layers."
@@ -444,26 +444,31 @@ def attention(query, key, value, mask=None, dropout=None):
 class LabelSmoothing(nn.Module):
     "Implement label smoothing."
 
-    def __init__(self, size, padding_idx, smoothing=0.0):
+    def __init__(self, vocab_size:int, padding_idx:int=0, smoothing=0.0):
         super(LabelSmoothing, self).__init__()
         # 其实与cross-entropy-loss差不多, KL_divergence = 交叉熵 - 信息熵
-        # cross_entropy = -plog(q), 用q的分布来编码p
+        # cross_entropy = -plog(q), 用q的分布来编码p, 其中p为概率分布，-log(q)为编码长度，即出现概率越高，编码长度越短
         # entropy = -plog(p),用p的分布来编码p
-        # kl_div = cross_entropy - entropy = - plog(q) - (-plog(p)) = plog(p) - plog(q)
+        # kl_div = cross_entropy - entropy = -plog(q) - (-plog(p)) = plog(p) - plog(q)
         self.criterion = nn.KLDivLoss(reduction="sum")
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
-        self.size = size
+        self.vocab_size = vocab_size
         self.true_dist = None
 
-    def forward(self, x, target):
-        assert x.size(1) == self.size
-        true_dist = x.data.clone()
-        true_dist.fill_(value=self.smoothing / (self.size - 2)) # 值填充，Fills self tensor with the specified value.
+    # pred_scores:[batch*(seq_len-1), vocab]
+    # target_ids: [batch*(seq_len-1)]
+    def forward(self, pred_scores:Tensor, target_ids:Tensor):
+        assert pred_scores.size(1) == self.vocab_size
+        true_dist = pred_scores.data.clone()
+        # Fills self tensor with the specified value.
+        # true_dist:[batch*(seq_len-1), vocab]
+        true_dist.fill_(value=self.smoothing / (self.vocab_size - 2)) # 值填充，smoothing一般为0
         """
         https://pytorch.org/docs/stable/generated/torch.Tensor.scatter_.html?highlight=scatter_#torch.Tensor.scatter_
         This is the reverse operation of the manner described in gather().
+        注意：index.dim == src.dim,即均为2维或者均为3维
         self[index[i][j][k]] [j][k] = src[i][j][k]  # if dim == 0
         self[i] [index[i][j][k]] [k] = src[i][j][k]  # if dim == 1
         self[i][j] [index[i][j] [k]] = src[i][j][k]  # if dim == 2
@@ -475,13 +480,14 @@ class LabelSmoothing(nn.Module):
         >>> index = torch.tensor([[0, 1, 2, 0]]) 
         # index的坐标:ind[0,0]=0,ind[0,1]=1,ind[0,2]=2,ind[0,3]=0
         
-        >>> torch.zeros(3, 5, dtype=src.dtype).scatter_(0, index, src)
+        >>> torch.zeros(3, 5, dtype=src.dtype).scatter_(dim=0, index=index, src=src)
         tensor([[1, 0, 0, 4, 0], # x[ind[0,0]=0,0]=src[0,0]=1, x[ind[0,3]=0,3]=src[0,3]=4
                 [0, 2, 0, 0, 0], # x[ind[0,1]=1,1]=src[0,1]=2
-                [0, 0, 3, 0, 0]]) # x[ind[0,2]=2,2] = src[0,2]=3
+                [0, 0, 3, 0, 0]])# x[ind[0,2]=2,2]=src[0,2]=3
         
-        >>> index = torch.tensor([[0, 1, 2], [0, 1, 4]]) # index的坐标:ind[0,0]=0,ind[0,1]=1,ind[0,2]=2,ind[1,0]=0,ind[1,1]=1,ind[1,2]=4
-        >>> torch.zeros(3, 5, dtype=src.dtype).scatter_(1, index, src)
+        >>> index = torch.tensor([[0, 1, 2], 
+                                  [0, 1, 4]]) # index的坐标:ind[0,0]=0,ind[0,1]=1,ind[0,2]=2,ind[1,0]=0,ind[1,1]=1,ind[1,2]=4
+        >>> torch.zeros(3, 5, dtype=src.dtype).scatter_(dim=1, index=index, src=src)
         tensor([[1, 2, 3, 0, 0], # x[0,ind[0,0]=0]=src[0,0]=1, x[0,ind[0,1]=1]=src[0,1]=2,x[0,ind[0,2]=2]=src[0,2]=3
                 [6, 7, 0, 0, 8], # x[1,ind[1,0]=0]=src[1,0]=6, x[1,ind[1,1]=1]=src[1,1]=7,x[1,ind[1,2]=4]=src[1,2]=8,
                 [0, 0, 0, 0, 0]])        
@@ -511,27 +517,37 @@ class LabelSmoothing(nn.Module):
         unsqueeze:
         Returns a new tensor with a dimension of size one inserted at the specified position.
         """
-        true_dist.scatter_(dim=1, index=target.data.unsqueeze(1), value=self.confidence) #
+        # true_dist:[batch*(seq_len-1), vocab]
+        # target_ids: [batch*(seq_len-1)]
+        #      => [batch*(seq_len-1), 1]
+        true_dist.scatter_(dim=1, index=target_ids.data.unsqueeze(1), value=self.confidence) # 直接对于target_ids所在的位置赋值confidence=1
+        # true_dist:[batch*(seq_len-1), vocab]
         true_dist[:, self.padding_idx] = 0
-        mask = torch.nonzero(target.data == self.padding_idx)
-        if mask.dim() > 0:
+
+        # target_ids: [batch*(seq_len-1)]
+        # mask-indexs: []
+        mask_indexs = torch.nonzero(target_ids.data == self.padding_idx) # 返回值为padding_idx元素的(i,j)索引值
+        if mask_indexs.dim() > 0: # 若mask是向量
             """
-            >>> x = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)
+            >>> x = torch.tensor([[1, 2, 3], 
+                                  [4, 5, 6], 
+                                  [7, 8, 9]], dtype=torch.float)
             >>> index = torch.tensor([0, 2])
             >>> x.index_fill_(dim=1, index=index, value=-1)
             tensor([[-1.,  2., -1.],
                     [-1.,  5., -1.],
                     [-1.,  8., -1.]])
-                    
             tensor.detach():
             Returns a new Tensor, detached from the current graph. The result will never require gradient
             """
-            true_dist.index_fill_(dim=0, index=mask.squeeze(), value=0.0)
+            true_dist.index_fill_(dim=0, index=mask_indexs.squeeze(), value=0.0) # 在mask 的地方赋值0
         self.true_dist = true_dist
-        return self.criterion(x, true_dist.clone().detach())
+        # out:[1]
+        out = self.criterion(input=pred_scores, target=true_dist.clone().detach())
+        return out
 
 # > This code predicts a translation using greedy decoding for simplicity.
-def greedy_decode(model, src, src_mask, max_len, start_symbol):
+def greedy_decode(model, src:Tensor, src_mask:Tensor, max_len:int, start_symbol):
     memory = model.encode(src, src_mask)
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
@@ -622,13 +638,18 @@ class SimpleLossCompute:
         self.generator = generator
         self.criterion = criterion
 
-    # x:[batch, seq_len-1, d_model]
-    # y:[batch, seq_len-1]
-    def __call__(self, x, y, norm:float):
-        # x:[batch, seq_len-1, d_model]
-        # x_gen:[batch_size, seq_len-1, vocab]
-        x_gen = self.generator(x)
-        sloss = (self.criterion(x_gen.contiguous().view(-1, x_gen.size(-1)), y.contiguous().view(-1)) / norm)
+    # model_out:[batch, seq_len-1, d_model]
+    # y_ids:[batch, seq_len-1]
+    def __call__(self, model_out, y_ids, norm:float):
+        # model_out:[batch, seq_len-1, d_model]
+        # predict:[batch, seq_len-1, vocab]
+        predict = self.generator(model_out)
+        # predict:[batch, seq_len-1, vocab]
+        #      => [batch*(seq_len-1), vocab]
+        # y_ids: [batch, seq_len-1]
+        #     => [batch*(seq_len-1)]
+        sloss = (self.criterion(predict.contiguous().view(-1, predict.size(-1)),
+                                y_ids.contiguous().view(-1)) / norm)
         return sloss.data * norm, sloss
 
 def run_epoch(data_iter, model:nn.Module, loss_compute:SimpleLossCompute, optimizer, scheduler, mode="train", accum_iter=1, train_state=TrainState(),):
@@ -925,7 +946,7 @@ def train_worker(
         is_main_process = gpu == 0
 
     criterion = LabelSmoothing(
-        size=len(vocab_tgt), padding_idx=pad_idx, smoothing=0.1
+        vocab_size=len(vocab_tgt), padding_idx=pad_idx, smoothing=0.1
     )
     criterion.cuda(gpu)
 

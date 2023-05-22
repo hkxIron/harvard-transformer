@@ -270,7 +270,7 @@ def penalization_visualization():
 # Train the simple copy task.
 def example_simple_model():
     vocab_size = 10 + 1
-    criterion = LabelSmoothing(size=vocab_size, padding_idx=0, smoothing=0.0)
+    criterion = LabelSmoothing(vocab_size=vocab_size, padding_idx=0, smoothing=0.0)
     model = make_model(src_vocab=vocab_size, tgt_vocab=vocab_size, N=2)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9)
