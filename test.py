@@ -312,7 +312,8 @@ def example_simple_model():
     max_len = src.shape[1] # seq_len=10
     # src_mask:[batch,1,seq_len]
     src_mask = torch.ones(1, 1, max_len)
-    print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0))
+    # 输出：tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    print("greedy_decode:",greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0))
 
 
 def run_model_example(n_examples=5):
