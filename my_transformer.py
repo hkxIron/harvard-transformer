@@ -104,7 +104,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     # x:[batch, seq_len, d_model]
-    def forward(self, x):
+    def forward(self, x:Tensor):
         # position_enc: [1, seq_len, d_model]
         position_enc = self.pe[:, : x.size(1)].requires_grad_(False)
         # out:[batch, seq_len, d_model]
@@ -132,7 +132,7 @@ class MultiHeadedAttention(nn.Module):
     #   decoder时mask:[batch, seq_len-1, seq_len-1]
     #
     # return: [batch, seq_len, d_model]
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query:Tensor, key:Tensor, value:Tensor, mask:Tensor=None):
         "Implements Figure 2"
         if mask is not None:
             # Same mask applied to all head_num heads.
@@ -199,7 +199,7 @@ class EncoderLayer(nn.Module):
         self.size = size
 
     # x:[batch, seq_len, d_model]
-    def forward(self, x, mask):
+    def forward(self, x:Tensor, mask:Tensor):
         "Follow Figure 1 (left) for connections."
         """
         1. self attention
@@ -223,7 +223,7 @@ class Generator(nn.Module):
         self.proj = nn.Linear(in_features=d_model, out_features=vocab)
 
     # x:[batch_size, seq_len-1, d_model]
-    def forward(self, x):
+    def forward(self, x:Tensor):
         # out:[batch_size, seq_len-1, vocab]
         out = log_softmax(input=self.proj(x), dim=-1) # 即: log(softmax(x)), 为了计算稳定性
         return out
@@ -240,7 +240,7 @@ class Encoders(nn.Module):
         self.layers:EncoderLayer = clones(layer, N)
         self.norm = LayerNorm(features=layer.size)
 
-    def forward(self, x, mask):
+    def forward(self, x:Tensor, mask:Tensor):
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers: # 6层transformer
             x = layer(x, mask)
@@ -262,7 +262,7 @@ class LayerNorm(nn.Module):
         self.b_2 = nn.Parameter(torch.zeros(features))
         self.eps = eps
 
-    def forward(self, x):
+    def forward(self, x:Tensor):
         mean = x.mean(dim=-1, keepdim=True)
         std = x.std(dim=-1, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
@@ -279,7 +279,7 @@ class NormResidualDropout(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     # x:[batch, seq_len, d_model]
-    def forward(self, x, sublayer:nn.Module):
+    def forward(self, x:Tensor, sublayer:nn.Module):
         "Apply residual connection to any sublayer with the same size."
         # residual layer在之前会layer_norm,之后会drop_out
         """
@@ -307,7 +307,7 @@ class DecoderLayer(nn.Module):
     # src_mask:[batch,1,seq_len]
     # tgt_mask:[batch,seq_len-1,seq_len-1]
     # return: [batch, seq_len-1, d_model]
-    def forward(self, x, encoder_memory, src_mask, tgt_mask):
+    def forward(self, x:Tensor, encoder_memory:Tensor, src_mask:Tensor, tgt_mask:Tensor):
         "Follow Figure 1 (right) for connections."
         """
         1. self attention
@@ -332,7 +332,7 @@ class Decoders(nn.Module):
         self.layers = clones(layer, N)
         self.norm = LayerNorm(features=layer.size)
 
-    def forward(self, x, memory, src_mask, tgt_mask):
+    def forward(self, x:Tensor, memory:Tensor, src_mask:Tensor, tgt_mask:Tensor):
         for layer in self.layers:
             x = layer(x, memory, src_mask, tgt_mask)
         return self.norm(x)
@@ -355,7 +355,7 @@ class EncoderDecoder(nn.Module):
     # tgt_ids:[batch_size, seq_len-1]
     # src_mask:[batch_size, 1, seq_len]
     # tgt_mask:[batch_size, seq_len-1, seq_len-1]
-    def forward(self, src_ids, tgt_ids, src_mask, tgt_mask):
+    def forward(self, src_ids:Tensor, tgt_ids:Tensor, src_mask:Tensor, tgt_mask:Tensor):
         "Take in and process masked src and target sequences."
         # 先encode,再decode
         # enc:[batch, seq_len, d_model]
@@ -371,7 +371,7 @@ class EncoderDecoder(nn.Module):
     # src_ids:[batch, seq_len]
     # src_mask:[batch, 1, seq_len]
     # out:[batch, seq_len, d_model]
-    def encode(self, src_ids, src_mask):
+    def encode(self, src_ids:Tensor, src_mask:Tensor):
         # embed:[batch, seq_len, d_model]
         embed = self.src_embed(src_ids)
         # out:[batch, seq_len, d_model]
@@ -382,14 +382,14 @@ class EncoderDecoder(nn.Module):
     # src_mask:[batch, 1, seq_len]
     # tgt_ids:[batch, seq_len-1]
     # tgt_mask:[batch, seq_len-1, seq_len-1]
-    def decode(self, encoder_memory, src_mask, tgt_ids, tgt_mask):
+    def decode(self, encoder_memory:Tensor, src_mask:Tensor, tgt_ids:Tensor, tgt_mask:Tensor):
         # embed:[batch, seq_len-1, d_model]
         embed = self.tgt_embed(tgt_ids)
         # out:[batch, seq_len-1, d_model]
         out = self.decoder(embed, encoder_memory, src_mask, tgt_mask)
         return out
 
-def subsequent_mask(size:int):
+def subsequent_mask(size:int)->Tensor:
     "Mask out subsequent positions."
     """
     >>> a = torch.randn(3, 3)
@@ -417,7 +417,7 @@ mask:
     attn_value: [batch, head, seq_len, d_k]
     p_attn: [batch, head, seq_len, seq_len]
 """
-def attention(query, key, value, mask=None, dropout=None):
+def attention(query:Tensor, key:Tensor, value:Tensor, mask:Tensor=None, dropout:nn.Dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_model = query.size(-1)
     # 之所以除以d_model,因为如果key,query方差为1,均值为0, 则query@key之后，其方差为d_model
@@ -449,8 +449,9 @@ class LabelSmoothing(nn.Module):
         # 其实与cross-entropy-loss差不多, KL_divergence = 交叉熵 - 信息熵
         # cross_entropy = -plog(q), 用q的分布来编码p, 其中p为概率分布，-log(q)为编码长度，即出现概率越高，编码长度越短
         # entropy = -plog(p),用p的分布来编码p
-        # kl_div = cross_entropy - entropy = -plog(q) - (-plog(p)) = plog(p) - plog(q)
-        self.criterion = nn.KLDivLoss(reduction="sum")
+        # kl_div = cross_entropy - entropy = -plog(q) - (-plog(p)) = plog(p) - plog(q) = p*(log(p)-log(q))
+        # => target*(log(target) - log(pred))
+        self.kldiv_loss = nn.KLDivLoss(reduction="sum")
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
@@ -543,21 +544,31 @@ class LabelSmoothing(nn.Module):
             true_dist.index_fill_(dim=0, index=mask_indexs.squeeze(), value=0.0) # 在mask 的地方赋值0
         self.true_dist = true_dist
         # out:[1]
-        out = self.criterion(input=pred_scores, target=true_dist.clone().detach())
+        out = self.kldiv_loss(input=pred_scores, target=true_dist.clone().detach())
         return out
 
 # > This code predicts a translation using greedy decoding for simplicity.
-def greedy_decode(model, src:Tensor, src_mask:Tensor, max_len:int, start_symbol):
+# src:[batch=1, seq_len]
+# src_mask:[batch=1, 1,seq_len]
+def greedy_decode(model:EncoderDecoder, src:Tensor, src_mask:Tensor, max_len:int, start_symbol:int)->Tensor:
+    # memory:[batch=1, seq_len, d_model]
     memory = model.encode(src, src_mask)
+    # ys:[batch=1,seq_len=1]
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
-        out = model.decode(memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data))
-        prob = model.generator(out[:, -1])
+        # tgt_mask: [1, cur_seq_len, cur_seq_len], 对角线及下三角为1,其余为0
+        tgt_mask = subsequent_mask(ys.size(1)).type_as(src.data)
+        # out:[batch, cur_seq_len, d_model]
+        out = model.decode(memory, src_mask, ys, tgt_mask)
+        prob = model.generator(out[:, -1]) # prob:[batch, vocab_size]
         _, next_word = torch.max(prob, dim=1)
         next_word = next_word.data[0]
+        # ys:[batch=1,seq_len+1]
         ys = torch.cat(
-            [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
+            [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)],
+            dim=1
         )
+    # ys:[batch=1,seq_len]
     return ys
 
 """
@@ -591,7 +602,7 @@ def make_model(src_vocab:int, tgt_vocab:int, N=6, d_model=512, d_ff=2048, head_n
 class Batch:
     """Object for holding a batch of data with mask during training."""
 
-    def __init__(self, src, tgt=None, pad=2):  # 2 = <blank>
+    def __init__(self, src:Tensor, tgt:Tensor=None, pad=2):  # 2 = <blank>
         # src:[batch, seq_len]
         self.src = src
         # src_mask:[batch, 1, seq_len]
@@ -607,7 +618,7 @@ class Batch:
             self.ntokens = (self.tgt_y != pad).data.sum()
 
     @staticmethod
-    def make_std_mask(tgt, pad:int):
+    def make_std_mask(tgt:Tensor, pad:int):
         "Create a mask to hide padding and future words."
         # tgt:[batch, seq_len]
         # tgt_mask:[batch, 1, seq_len]
@@ -648,11 +659,16 @@ class SimpleLossCompute:
         #      => [batch*(seq_len-1), vocab]
         # y_ids: [batch, seq_len-1]
         #     => [batch*(seq_len-1)]
-        sloss = (self.criterion(predict.contiguous().view(-1, predict.size(-1)),
-                                y_ids.contiguous().view(-1)) / norm)
-        return sloss.data * norm, sloss
+        loss = (self.criterion(predict.contiguous().view(-1, predict.size(-1)),
+                               y_ids.contiguous().view(-1)) / norm)
+        return loss.data * norm, loss
 
-def run_epoch(data_iter, model:nn.Module, loss_compute:SimpleLossCompute, optimizer, scheduler, mode="train", accum_iter=1, train_state=TrainState(),):
+def run_epoch(data_iter, model:nn.Module,
+              loss_compute:SimpleLossCompute,
+              optimizer:torch.optim.Optimizer,
+              scheduler,
+              mode="train",
+              accum_iter=1, train_state=TrainState(),):
     """Train a single epoch"""
     start = time.time()
     total_tokens = 0

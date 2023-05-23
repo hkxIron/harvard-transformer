@@ -48,18 +48,19 @@ def loss(x, crit):
     predict = torch.FloatTensor([[0, x / d, 1 / d, 1 / d, 1 / d]])
     return crit(predict.log(), torch.LongTensor([1])).data
 
-
-def data_gen(V, batch_size, nbatches):
+PAD = 0
+EOS = 1
+def data_gen(vocab_size:int, batch_size:int, nbatches:int):
     "Generate random data for a src-tgt copy task."
     seq_len = 10
     for i in range(nbatches):
-        data = torch.randint(low=1, high=V, size=(batch_size, seq_len)) # 生成的值在[1, v-1]之间
-        data[:, 0] = 1 # 第0位为EOS=1, PAD = 0
+        data = torch.randint(low=1, high=vocab_size, size=(batch_size, seq_len)) # 生成的值在[1, v-1]之间
+        data[:, 0] = EOS # 第0位为EOS=1, PAD = 0
         # src:[batch,seq_len]
         src = data.requires_grad_(False).clone().detach() # detach就是不需要梯度
         # tgt:[batch,seq_len]
         tgt = data.requires_grad_(False).clone().detach()
-        yield Batch(src, tgt, pad=0)
+        yield Batch(src, tgt, pad=PAD)
 
 def example_mask():
     LS_data = pd.concat(
@@ -280,7 +281,9 @@ def example_simple_model():
         lr_lambda=lambda step: rate(step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400),)
 
     batch_size = 80
-    for epoch in range(20):
+    epoch_num = 20
+    #epoch_num = 1
+    for epoch in range(epoch_num):
         # Sets the module in training mode.其中dropout有影响,在train时需要1/p
         model.train()
         # train
@@ -303,9 +306,11 @@ def example_simple_model():
             mode="eval",
         )[0]
 
-    model.eval() # set test mode
+    model.eval() # set test mode, 展示部分例子
+    # src:[batch, seq_len]
     src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
-    max_len = src.shape[1]
+    max_len = src.shape[1] # seq_len=10
+    # src_mask:[batch,1,seq_len]
     src_mask = torch.ones(1, 1, max_len)
     print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0))
 
