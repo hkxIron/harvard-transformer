@@ -54,7 +54,7 @@ class PositionWiseFeedForward(nn.Module):
     "Implements FFN equation."
 
     # 注意：feedforward一般比d_model大很多
-    def __init__(self, d_model, d_ff, dropout=0.1):
+    def __init__(self, d_model:int, d_ff:int, dropout=0.1):
         super(PositionWiseFeedForward, self).__init__()
         self.w_1 = nn.Linear(d_model, d_ff)
         self.w_2 = nn.Linear(d_ff, d_model)
@@ -62,7 +62,7 @@ class PositionWiseFeedForward(nn.Module):
 
     # x:[batch,seq_len, d_model]
     # out:[batch,seq_len, d_model]
-    def forward(self, x):
+    def forward(self, x:Tensor):
         return self.w_2(self.dropout(self.w_1(x).relu()))
 
 
@@ -195,10 +195,13 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
         self.self_attn:MultiHeadedAttention = self_attn
         self.feed_forward:PositionWiseFeedForward = feed_forward
-        self.residualLayers = clones(NormResidualDropout(size, dropout), N=2)
+        self.residualLayers = clones(NormDropoutResidual(size, dropout), N=2)
         self.size = size
 
     # x:[batch, seq_len, d_model]
+    # mask:
+    #   encoder时mask:[batch, 1, seq_len]，
+    #   decoder时mask:[batch, seq_len-1, seq_len-1]
     def forward(self, x:Tensor, mask:Tensor):
         "Follow Figure 1 (left) for connections."
         """
@@ -210,6 +213,9 @@ class EncoderLayer(nn.Module):
         """
         # x:[batch, seq_len, d_model]
         # attention_out:[batch, seq_len, d_model]
+        # mask:
+        #   encoder时mask:[batch, 1, seq_len]，
+        #   decoder时mask:[batch, seq_len-1, seq_len-1]
         x = self.residualLayers[0](x, sublayer=lambda x: self.self_attn(query=x, key=x, value=x, mask=mask))
         # x:[batch, seq_len, d_model]
         x = self.residualLayers[1](x, sublayer=self.feed_forward)
@@ -237,9 +243,13 @@ class Encoders(nn.Module):
 
     def __init__(self, layer:EncoderLayer, N:int=6):
         super(Encoders, self).__init__()
-        self.layers:EncoderLayer = clones(layer, N)
+        self.layers:nn.ModuleList = clones(layer, N)
         self.norm = LayerNorm(features=layer.size)
 
+    # x:[batch, seq_len, d_model]
+    # mask:
+    #   encoder时mask:[batch, 1, seq_len]，
+    #   decoder时mask:[batch, seq_len-1, seq_len-1]
     def forward(self, x:Tensor, mask:Tensor):
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers: # 6层transformer
@@ -262,19 +272,20 @@ class LayerNorm(nn.Module):
         self.b_2 = nn.Parameter(torch.zeros(features))
         self.eps = eps
 
+    # x:[batch, seq_len, d_model]
     def forward(self, x:Tensor):
-        mean = x.mean(dim=-1, keepdim=True)
+        mean = x.mean(dim=-1, keepdim=True) # 即模型的每一个维度上计算均值与方差
         std = x.std(dim=-1, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
-class NormResidualDropout(nn.Module):
+class NormDropoutResidual(nn.Module):
     """
     A residual connection followed by a layer norm.
     Note for code simplicity the norm is first as opposed to last.
     """
 
     def __init__(self, size:int, dropout:float):
-        super(NormResidualDropout, self).__init__()
+        super(NormDropoutResidual, self).__init__()
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
 
@@ -294,13 +305,17 @@ class NormResidualDropout(nn.Module):
 class DecoderLayer(nn.Module):
     "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
 
-    def __init__(self, size:int, self_attn:MultiHeadedAttention, src_attn:MultiHeadedAttention, feed_forward:PositionWiseFeedForward, dropout:float):
+    def __init__(self, size:int,
+                 self_attn:MultiHeadedAttention,
+                 src_attn:MultiHeadedAttention,
+                 feed_forward:PositionWiseFeedForward,
+                 dropout:float):
         super(DecoderLayer, self).__init__()
         self.size = size
         self.self_attn:MultiHeadedAttention = self_attn
         self.src_attn:MultiHeadedAttention = src_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(NormResidualDropout(size, dropout), 3)
+        self.sublayer = clones(NormDropoutResidual(size, dropout), 3)
 
     # x:[batch, seq_len-1, d_model]
     # encoder_memory:[batch, seq_len, d_model]
@@ -311,15 +326,17 @@ class DecoderLayer(nn.Module):
         "Follow Figure 1 (right) for connections."
         """
         1. self attention
-        2. layer norm + residual + dropout
+        2. layer norm + dropout + residual
         
         3. src-target cross attention
-        4. layer norm + residual + dropout
+        4. layer norm + dropout + residual
         
         5. feed forward 
-        6. layer norm + residual + dropout
+        6. layer norm + dropout + residual
         """
+        # 先self attention
         x = self.sublayer[0](x, lambda x: self.self_attn(query=x, key=x, value=x, mask=tgt_mask))
+        # 之后cross attention
         x = self.sublayer[1](x, lambda x: self.src_attn(query=x, key=encoder_memory, value=encoder_memory, mask=src_mask))
         x = self.sublayer[2](x, self.feed_forward)
         return x
@@ -332,6 +349,10 @@ class Decoders(nn.Module):
         self.layers = clones(layer, N)
         self.norm = LayerNorm(features=layer.size)
 
+    # x:[batch, seq_len-1, d_model]
+    # memory:[batch, seq_len, d_model]
+    # src_mask:[batch,1,seq_len]
+    # tgt_mask:[batch,seq_len-1,seq_len-1]
     def forward(self, x:Tensor, memory:Tensor, src_mask:Tensor, tgt_mask:Tensor):
         for layer in self.layers:
             x = layer(x, memory, src_mask, tgt_mask)
@@ -342,7 +363,6 @@ class EncoderDecoder(nn.Module):
     A standard Encoder-Decoder architecture. Base for this and many
     other models.
     """
-
     def __init__(self, encoder:EncoderLayer, decoder:DecoderLayer, src_embed:Embeddings, tgt_embed:Embeddings, generator:Generator):
         super(EncoderDecoder, self).__init__()
         self.encoder = encoder
@@ -557,18 +577,24 @@ def greedy_decode(model:EncoderDecoder, src:Tensor, src_mask:Tensor, max_len:int
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
         # tgt_mask: [1, cur_seq_len, cur_seq_len], 对角线及下三角为1,其余为0
-        tgt_mask = subsequent_mask(ys.size(1)).type_as(src.data)
+        cur_seq_len = ys.size(1)
+        tgt_mask = subsequent_mask(cur_seq_len).type_as(src.data)
+        # src_mask:[batch=1, 1,seq_len]
+        # ys:[batch=1, seq_len=1]
         # out:[batch, cur_seq_len, d_model]
         out = model.decode(memory, src_mask, ys, tgt_mask)
-        prob = model.generator(out[:, -1]) # prob:[batch, vocab_size]
+        # last_out: [d_model], 取最后一列进行预测
+        last_out = out[:, -1]
+        # prob:[batch=1, vocab_size]
+        prob = model.generator(last_out)
         _, next_word = torch.max(prob, dim=1)
         next_word = next_word.data[0]
-        # ys:[batch=1,seq_len+1]
+        # ys:[batch=1,cur_seq_len+1]
         ys = torch.cat(
             [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)],
-            dim=1
-        )
-    # ys:[batch=1,seq_len]
+            dim=1)
+
+    # ys:[batch=1, seq_len]
     return ys
 
 """
@@ -611,7 +637,7 @@ class Batch:
             # tgt:[batch, seq_len-1]
             self.tgt = tgt[:, :-1]
             # tgt_y:[batch, seq_len-1]
-            self.tgt_y = tgt[:, 1:] # y右移一位
+            self.tgt_y = tgt[:, 1:] # y右移一位,即输入什么就输出什么
             # tgt_mask:[batch, seq_len-1, seq_len-1], 下三角矩阵
             self.tgt_mask = self.make_std_mask(self.tgt, pad)
             # ntokens:int
@@ -659,16 +685,17 @@ class SimpleLossCompute:
         #      => [batch*(seq_len-1), vocab]
         # y_ids: [batch, seq_len-1]
         #     => [batch*(seq_len-1)]
-        loss = (self.criterion(predict.contiguous().view(-1, predict.size(-1)),
-                               y_ids.contiguous().view(-1)) / norm)
-        return loss.data * norm, loss
+        loss = self.criterion(predict.contiguous().view(-1, predict.size(-1)),
+                               y_ids.contiguous().view(-1))
+        return loss.data, loss/norm
 
 def run_epoch(data_iter, model:nn.Module,
               loss_compute:SimpleLossCompute,
               optimizer:torch.optim.Optimizer,
               scheduler,
               mode="train",
-              accum_iter=1, train_state=TrainState(),):
+              accum_iter=1,
+              train_state=TrainState(),):
     """Train a single epoch"""
     start = time.time()
     total_tokens = 0

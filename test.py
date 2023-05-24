@@ -58,7 +58,7 @@ def data_gen(vocab_size:int, batch_size:int, nbatches:int):
         data[:, 0] = EOS # 第0位为EOS=1, PAD = 0
         # src:[batch,seq_len]
         src = data.requires_grad_(False).clone().detach() # detach就是不需要梯度
-        # tgt:[batch,seq_len]
+        # tgt:[batch,seq_len], 注意：此处src,tgt数据相同
         tgt = data.requires_grad_(False).clone().detach()
         yield Batch(src, tgt, pad=PAD)
 
@@ -281,8 +281,8 @@ def example_simple_model():
         lr_lambda=lambda step: rate(step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400),)
 
     batch_size = 80
-    epoch_num = 20
-    #epoch_num = 1
+    #epoch_num = 20
+    epoch_num = 1
     for epoch in range(epoch_num):
         # Sets the module in training mode.其中dropout有影响,在train时需要1/p
         model.train()
@@ -297,7 +297,7 @@ def example_simple_model():
         )
         # eval
         model.eval() # set test mode
-        run_epoch(
+        eval_loss = run_epoch(
             data_gen(vocab_size, batch_size, 5),
             model,
             SimpleLossCompute(model.generator, criterion),
@@ -305,6 +305,7 @@ def example_simple_model():
             DummyScheduler(),
             mode="eval",
         )[0]
+        print("train loss:", eval_loss)
 
     model.eval() # set test mode, 展示部分例子
     # src:[batch, seq_len]
@@ -313,7 +314,8 @@ def example_simple_model():
     # src_mask:[batch,1,seq_len]
     src_mask = torch.ones(1, 1, max_len)
     # 输出：tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
-    print("greedy_decode:",greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0))
+    # 输出：tensor([[0, 2, 3, 4, 5, 6, 5, 7, 8, 8]]),所以是随机模型
+    print("greedy_decode:", greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0))
 
 
 def run_model_example(n_examples=5):
@@ -331,7 +333,7 @@ def run_model_example(n_examples=5):
     )
 
     print("Loading Trained Model ...")
-
+    # 加载模型进行预测
     model = make_model(len(vocab_src), len(vocab_tgt), N=6)
     model.load_state_dict(
         torch.load("multi30k_model_final.pt", map_location=torch.device("cpu"))
@@ -394,7 +396,6 @@ def viz_decoder_self():
 
 
 # show_example(viz_decoder_self)
-
 
 # %% tags=[]
 def viz_decoder_src():
