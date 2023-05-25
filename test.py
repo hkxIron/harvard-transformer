@@ -272,23 +272,23 @@ def penalization_visualization():
 def example_simple_model():
     vocab_size = 10 + 1
     criterion = LabelSmoothing(vocab_size=vocab_size, padding_idx=0, smoothing=0.0)
-    model = make_model(src_vocab=vocab_size, tgt_vocab=vocab_size, N=2)
+    model = make_model(src_vocab_size=vocab_size, tgt_vocab_size=vocab_size, N=2)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9)
     # 用来自定义学习率
     lr_scheduler = LambdaLR(
         optimizer=optimizer,
-        lr_lambda=lambda step: rate(step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400),)
+        lr_lambda=lambda step: rate(step, model_size=model.src_embed.vocab_embedding.d_model, factor=1.0, warmup=400),)
 
     batch_size = 80
     #epoch_num = 20
-    epoch_num = 1
+    epoch_num = 5
     for epoch in range(epoch_num):
         # Sets the module in training mode.其中dropout有影响,在train时需要1/p
         model.train()
         # train
         run_epoch(
-            data_gen(vocab_size, batch_size, 20),
+            data_gen(vocab_size, batch_size, nbatches=20),
             model,
             SimpleLossCompute(model.generator, criterion),
             optimizer,
@@ -298,7 +298,7 @@ def example_simple_model():
         # eval
         model.eval() # set test mode
         eval_loss = run_epoch(
-            data_gen(vocab_size, batch_size, 5),
+            data_gen(vocab_size, batch_size, nbatches=5),
             model,
             SimpleLossCompute(model.generator, criterion),
             DummyOptimizer(),

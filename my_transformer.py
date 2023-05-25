@@ -52,29 +52,34 @@ class DummyScheduler:
 
 class PositionWiseFeedForward(nn.Module):
     "Implements FFN equation."
+    """
+    feedforward并没有什么神秘之处，只不过是针对最后d_model维度进行两层MLP
+    可以理解为对最后一维度进行加宽后压缩
+    """
 
-    # 注意：feedforward一般比d_model大很多
+    # 注意：d_ff 一般比d_model大很多,如d_ff=2048, d_model=512
     def __init__(self, d_model:int, d_ff:int, dropout=0.1):
         super(PositionWiseFeedForward, self).__init__()
-        self.w_1 = nn.Linear(d_model, d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
+        self.w_1 = nn.Linear(d_model, d_ff, bias=True)
+        self.w_2 = nn.Linear(d_ff, d_model, bias=True)
         self.dropout = nn.Dropout(dropout)
 
     # x:[batch,seq_len, d_model]
     # out:[batch,seq_len, d_model]
     def forward(self, x:Tensor):
+        # 注意：第二层后面没有激活函数
         return self.w_2(self.dropout(self.w_1(x).relu()))
 
 
-class Embeddings(nn.Module):
-    def __init__(self, d_model, vocab):
-        super(Embeddings, self).__init__()
-        self.embed = nn.Embedding(vocab, d_model)
+class VocabEmbedding(nn.Module):
+    def __init__(self, d_model:int, vocab:int):
+        super(VocabEmbedding, self).__init__()
+        self.embed = nn.Embedding(num_embeddings=vocab, embedding_dim=d_model)
         self.d_model = d_model
 
     # x: [batch, seq_len]
-    # out:[batch, seq_len, vocab]
-    def forward(self, x):
+    # out:[batch, seq_len, d_model]
+    def forward(self, x:Tensor):
         return self.embed(x) * math.sqrt(self.d_model)
 
 #
@@ -83,7 +88,6 @@ class Embeddings(nn.Module):
 # $$PE_{(pos,2i+1)} = \cos(pos / 10000^{2i/d_{\text{model}}})$$
 #
 
-# %% id="zaHGD4yJTsqH"
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
 
@@ -110,6 +114,22 @@ class PositionalEncoding(nn.Module):
         # out:[batch, seq_len, d_model]
         x = x + position_enc
         return self.dropout(x)
+
+class EmbeddingPlusPositionEncoding(nn.Module):
+    def __init__(self, vocab_embedding:VocabEmbedding, position_encoding:PositionalEncoding):
+        super(EmbeddingPlusPositionEncoding, self).__init__()
+        self.vocab_embedding = vocab_embedding
+        self.position_encoding = position_encoding
+
+    # x: [batch, seq_len]
+    # out:[batch, seq_len, d_model]
+    def forward(self, x:Tensor):
+        # x: [batch, seq_len]
+        # embed:[batch, seq_len, d_model]
+        embed = self.vocab_embedding(x)
+        # out:[batch, seq_len, d_model]
+        out = self.position_encoding(embed)
+        return out
 
 class MultiHeadedAttention(nn.Module):
     def __init__(self, head_num:int, d_model:int, dropout:float=0.1):
@@ -239,7 +259,7 @@ def clones(module:nn.Module, N:int):
     return nn.ModuleList(modules=[copy.deepcopy(module) for _ in range(N)])
 
 class Encoders(nn.Module):
-    "Core encoder is a stack of N layers"
+    "Core encoders is a stack of N layers"
 
     def __init__(self, layer:EncoderLayer, N:int=6):
         super(Encoders, self).__init__()
@@ -342,11 +362,11 @@ class DecoderLayer(nn.Module):
         return x
 
 class Decoders(nn.Module):
-    "Generic N layer decoder with masking."
+    "Generic N layer decoders with masking."
 
     def __init__(self, layer:DecoderLayer, N:int):
         super(Decoders, self).__init__()
-        self.layers = clones(layer, N)
+        self.layers:nn.ModuleList = clones(layer, N)
         self.norm = LayerNorm(features=layer.size)
 
     # x:[batch, seq_len-1, d_model]
@@ -363,13 +383,13 @@ class EncoderDecoder(nn.Module):
     A standard Encoder-Decoder architecture. Base for this and many
     other models.
     """
-    def __init__(self, encoder:EncoderLayer, decoder:DecoderLayer, src_embed:Embeddings, tgt_embed:Embeddings, generator:Generator):
+    def __init__(self, encoder:Encoders, decoder:Decoders, src_embed:EmbeddingPlusPositionEncoding, tgt_embed:EmbeddingPlusPositionEncoding, generator:Generator):
         super(EncoderDecoder, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.generator = generator
+        self.encoders:Encoders = encoder
+        self.decoders:Decoders = decoder
+        self.src_embed:EmbeddingPlusPositionEncoding = src_embed
+        self.tgt_embed:EmbeddingPlusPositionEncoding = tgt_embed
+        self.generator:Generator = generator
 
     # src_ids:[batch_size, seq_len]
     # tgt_ids:[batch_size, seq_len-1]
@@ -377,15 +397,19 @@ class EncoderDecoder(nn.Module):
     # tgt_mask:[batch_size, seq_len-1, seq_len-1]
     def forward(self, src_ids:Tensor, tgt_ids:Tensor, src_mask:Tensor, tgt_mask:Tensor):
         "Take in and process masked src and target sequences."
-        # 先encode,再decode
-        # enc:[batch, seq_len, d_model]
-        enc = self.encode(src_ids, src_mask)
-        # enc:[batch, seq_len, d_model]
+        """
+        典型的翻译encoder-decoder架构
+        1.先对所有层进行encode生成memory
+        2.再对tgt_input_ids进行解码
+        """
+        # enc_memory:[batch, seq_len, d_model]
+        enc_memory = self.encode(src_ids, src_mask)
+        # enc_memory:[batch, seq_len, d_model]
         # src_mask:[batch, 1, seq_len]
         # tgt_ids:[batch, seq_len-1]
         # tgt_mask:[batch, seq_len-1, seq_len-1]
         # out:[batch,seq_len-1,d_model]
-        out = self.decode(encoder_memory=enc, src_mask=src_mask, tgt_ids=tgt_ids, tgt_mask=tgt_mask)
+        out = self.decode(encoder_memory=enc_memory, src_mask=src_mask, tgt_ids=tgt_ids, tgt_mask=tgt_mask)
         return out
 
     # src_ids:[batch, seq_len]
@@ -395,7 +419,7 @@ class EncoderDecoder(nn.Module):
         # embed:[batch, seq_len, d_model]
         embed = self.src_embed(src_ids)
         # out:[batch, seq_len, d_model]
-        out = self.encoder(embed, src_mask)
+        out = self.encoders(embed, src_mask)
         return out
 
     # encoder_memory:[batch, seq_len, d_model]
@@ -406,7 +430,7 @@ class EncoderDecoder(nn.Module):
         # embed:[batch, seq_len-1, d_model]
         embed = self.tgt_embed(tgt_ids)
         # out:[batch, seq_len-1, d_model]
-        out = self.decoder(embed, encoder_memory, src_mask, tgt_mask)
+        out = self.decoders(embed, encoder_memory, src_mask, tgt_mask)
         return out
 
 def subsequent_mask(size:int)->Tensor:
@@ -601,7 +625,7 @@ def greedy_decode(model:EncoderDecoder, src:Tensor, src_mask:Tensor, max_len:int
 N: layer number
 注意：feedforward一般比d_model大很多
 """
-def make_model(src_vocab:int, tgt_vocab:int, N=6, d_model=512, d_ff=2048, head_num=8, dropout=0.1):
+def make_model(src_vocab_size:int, tgt_vocab_size:int, N=6, d_model=512, d_ff=2048, head_num=8, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     multi_attention = MultiHeadedAttention(head_num, d_model)
@@ -610,11 +634,12 @@ def make_model(src_vocab:int, tgt_vocab:int, N=6, d_model=512, d_ff=2048, head_n
     model = EncoderDecoder(
         encoder=Encoders(EncoderLayer(d_model, c(multi_attention), c(feed_forward), dropout), N),
         decoder=Decoders(DecoderLayer(d_model, c(multi_attention), c(multi_attention), c(feed_forward), dropout), N),
-        src_embed=nn.Sequential(Embeddings(d_model, src_vocab),
-                                c(position)),
-        tgt_embed=nn.Sequential(Embeddings(d_model, tgt_vocab),
-                                c(position)),
-        generator=Generator(d_model, tgt_vocab),
+        # src_embed=nn.Sequential(VocabEmbedding(d_model, src_vocab_size),c(position)),
+        # tgt_embed=nn.Sequential(VocabEmbedding(d_model, tgt_vocab_size),c(position)),
+        # 注意：src, tgt并没有共享embedding,因为它们的embedding size不一样
+        src_embed=EmbeddingPlusPositionEncoding(VocabEmbedding(d_model, src_vocab_size), c(position)),
+        tgt_embed=EmbeddingPlusPositionEncoding(VocabEmbedding(d_model, tgt_vocab_size), c(position)),
+        generator=Generator(d_model, tgt_vocab_size),
     )
 
     # This was important from their code.
@@ -689,7 +714,7 @@ class SimpleLossCompute:
                                y_ids.contiguous().view(-1))
         return loss.data, loss/norm
 
-def run_epoch(data_iter, model:nn.Module,
+def run_epoch(data_iter, model:EncoderDecoder,
               loss_compute:SimpleLossCompute,
               optimizer:torch.optim.Optimizer,
               scheduler,
@@ -711,6 +736,8 @@ def run_epoch(data_iter, model:nn.Module,
         # tgt_mask:[batch, seq_len-1, seq_len-1]
         # out:[batch, seq_len-1, d_model]
         out = model.forward(batch.src, batch.tgt, batch.src_mask, batch.tgt_mask)
+        #out = model(batch.src, batch.tgt, batch.src_mask, batch.tgt_mask)
+
         # out:[batch, seq_len-1, d_model]
         # tgt_y:[batch, seq_len-1]
         # ntokens:720
@@ -1168,7 +1195,7 @@ def check_outputs(
 # %% [markdown] id="0ZkkNTKLTsqO"
 # ## Attention Visualization
 #
-# > Even with a greedy decoder the translation looks pretty good. We
+# > Even with a greedy decoders the translation looks pretty good. We
 # > can further visualize it to see what is happening at each layer of
 # > the attention
 
