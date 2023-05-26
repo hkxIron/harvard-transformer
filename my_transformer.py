@@ -772,7 +772,14 @@ def run_epoch(data_iter, model:EncoderDecoder,
         del loss_node
     return total_loss / total_tokens, train_state
 
-
+"""
+可以利用下面的函数进行画图，图形先急骤上升，后面缓慢下降,见 images/lr_rate.png
+x=np.arange(0,4000)
+import matplotlib.pyplot as plt
+f=np.frompyfunc(lambda a:rate(a, model_size=512, factor=1.0, warmup=400),1,1)
+y=f(x)
+plt.plot(x,y)
+"""
 def rate(step:int, model_size:int, factor:float, warmup:int):
     """
     we have to default the step to 1 for LambdaLR function
@@ -781,9 +788,6 @@ def rate(step:int, model_size:int, factor:float, warmup:int):
     if step == 0:
         step = 1
     return factor * ( model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5)) )
-
-
-
 
 # ## Data Loading
 #
