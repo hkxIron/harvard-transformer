@@ -16,10 +16,12 @@ import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
+from typing import Optional,Union,Any,List
 from torch._tensor import Tensor
 # alt.renderers.enable('notebook')
 # alt.renderers.enable('mimetype')
 
+from torchtext.vocab import Vocab
 from torchtext.data.functional import to_map_style_dataset
 from torch.utils.data import DataLoader
 from torchtext.vocab import build_vocab_from_iterator
@@ -30,9 +32,37 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+import spacy
+from spacy.language import Language
 
 # Set to False to skip notebook execution (e.g. for debugging)
 warnings.filterwarnings("ignore")
+
+"""
+Transformer相关博客
+
+google官方transformer代码(不建议阅读,非常难懂):
+https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/models/transformer.py
+
+
+1.The Illustrated Transformer
+https://jalammar.github.io/illustrated-transformer/
+2.The Annotated Transformer
+http://nlp.seas.harvard.edu/2018/04/03/attention.html
+
+3. transformer论文 2017
+ Attention is All You Need  (https://arxiv.org/abs/1706.03762)
+
+4. 可参见我的代码(fork from https://github.com/Kyubyong/transformer,比较好懂 ):
+github.com:hkxIron/transformer.git
+https://github.com/hkxIron/transformer/blob/master/model.py
+
+这个代码注释非常好, 里面的代码也是学习tensorflow的最佳实践
+
+5. 放弃幻想，全面拥抱Transformer：自然语言处理三大特征抽取器（CNN/RNN/TF）比较
+https://zhuanlan.zhihu.com/p/54743941
+
+"""
 
 class DummyOptimizer(torch.optim.Optimizer):
     def __init__(self):
@@ -55,6 +85,8 @@ class PositionWiseFeedForward(nn.Module):
     """
     feedforward并没有什么神秘之处，只不过是针对最后d_model维度进行两层MLP
     可以理解为对最后一维度进行加宽后压缩
+    
+    每个位置都是分开并行向前传播的，但它们的参数w是共享的，所以被称为position-wise, seq_len 代表的就是position
     """
 
     # 注意：d_ff 一般比d_model大很多,如d_ff=2048, d_model=512
@@ -87,7 +119,25 @@ class VocabEmbedding(nn.Module):
 #
 # $$PE_{(pos,2i+1)} = \cos(pos / 10000^{2i/d_{\text{model}}})$$
 #
+"""
+    x 为embedding维度，pos为位置
+    embedding偶数维度:
+        PE(pos,2i)  =sin(pos/power(10000,2i/d_model)), 即偶数时为x-0
+    embedding奇数维度:
+        PE(pos,2i+1)=cos(pos/power(10000,2i/d_model)), 即奇数时为x-1
+    上面亦等价于:
+        PE(pos,x) = sin(pos/power(10000,  x/d_model)) ,    x为偶数
+        PE(pos,x) = cos(pos/power(10000, (x-1)/d_model)),  x为奇数
+        即为x-x%2
+        
+PE是一个二维矩阵，即[max_len, d_model], 每行为position, 每列为encoding不同的维度
+回忆y=a*sin(wx+b), T = 2*pai/w, sin(x)的T = 2*pai,
 
+PE的周期为：
+T(pos) = 2*pai*power(10000, encoding_dim/d_model), encoding_dim=0时，周期 T(pos)= 2*pai, encoding_dim=d_model时，T(pos) = 2*pai*10000~=6w
+
+使用训练的encoding作为position encoding也是相同的效果，但sin可以处理比训练遇到的更长的序列，即比embedding更好
+"""
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
 
@@ -101,7 +151,7 @@ class PositionalEncoding(nn.Module):
         # position:[max_len, 1]
         position = torch.arange(0, max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 0::2] = torch.sin(position * div_term) # 任意一个位置，奇数embedding维度用cos,偶数embedding维度用sin
         pe[:, 1::2] = torch.cos(position * div_term)
         # pe:[1, max_len, d_model]
         pe = pe.unsqueeze(0) # 这里不能加self.pe
@@ -486,7 +536,13 @@ def attention(query:Tensor, key:Tensor, value:Tensor, mask:Tensor=None, dropout:
     return attn_value, p_attn
 
 class LabelSmoothing(nn.Module):
-    "Implement label smoothing."
+    """
+    During training, we employed label smoothing of value epsilon=0.1. 
+    This hurts perplexity, as the model learns to be more unsure, but improves accuracy and BLEU score
+    其思想是：对于真实的标签保留质疑，不是完全相信，进行一定的偏移，比如label=1,则平滑后label=1-smoothing=0.9
+
+    即当预测的分数越来越置信时，loss会先减小，后增加
+    """
 
     def __init__(self, vocab_size:int, padding_idx:int=0, smoothing=0.0):
         super(LabelSmoothing, self).__init__()
@@ -500,16 +556,20 @@ class LabelSmoothing(nn.Module):
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
         self.vocab_size = vocab_size
-        self.true_dist = None
+        # smoothed_target_dist:[batch*(seq_len-1), vocab]
+        self.smoothed_target_dist:Optional[Tensor] = None #平滑后的标签分布
 
-    # pred_scores:[batch*(seq_len-1), vocab]
+    # pred_scores:[batch*(seq_len-1), vocab], loss是kl_diverse_loss,必须要求input在log域
     # target_ids: [batch*(seq_len-1)]
-    def forward(self, pred_scores:Tensor, target_ids:Tensor):
+    # 返回的是loss
+    def forward(self, pred_scores:Tensor, target_ids:Tensor)->Tensor:
         assert pred_scores.size(1) == self.vocab_size
-        true_dist = pred_scores.data.clone()
+        #smoothed_target_dist = pred_scores.data.clone()
+        # 标签平滑实际上是在惩罚过于自信的标签, smoothed_target_dist只与target_ids有关，而与pred_scores无关
+        smoothed_target_dist = torch.zeros_like(pred_scores)
         # Fills self tensor with the specified value.
-        # true_dist:[batch*(seq_len-1), vocab]
-        true_dist.fill_(value=self.smoothing / (self.vocab_size - 2)) # 值填充，smoothing一般为0
+        # smoothed_target_dist:[batch*(seq_len-1), vocab]
+        smoothed_target_dist.fill_(value=self.smoothing / (self.vocab_size - 2)) # smoothing值填充：padding占一位，target标签本身占一位，其它的所有概率进行平均，即 smoothing/(vocab-2)
         """
         https://pytorch.org/docs/stable/generated/torch.Tensor.scatter_.html?highlight=scatter_#torch.Tensor.scatter_
         This is the reverse operation of the manner described in gather().
@@ -562,12 +622,12 @@ class LabelSmoothing(nn.Module):
         unsqueeze:
         Returns a new tensor with a dimension of size one inserted at the specified position.
         """
-        # true_dist:[batch*(seq_len-1), vocab]
+        # smoothed_target_dist:[batch*(seq_len-1), vocab]
         # target_ids: [batch*(seq_len-1)]
         #      => [batch*(seq_len-1), 1]
-        true_dist.scatter_(dim=1, index=target_ids.data.unsqueeze(1), value=self.confidence) # 直接对于target_ids所在的位置赋值confidence=1
-        # true_dist:[batch*(seq_len-1), vocab]
-        true_dist[:, self.padding_idx] = 0
+        smoothed_target_dist.scatter_(dim=1, index=target_ids.data.unsqueeze(1), value=self.confidence) # 直接对于target_ids所在的位置赋值confidence=1-smoothing
+        # smoothed_target_dist:[batch*(seq_len-1), vocab]
+        smoothed_target_dist[:, self.padding_idx] = 0 # padding 地方直接填0, 注意index=0的位置是padding
 
         # target_ids: [batch*(seq_len-1)]
         # mask-indexs: []
@@ -585,10 +645,13 @@ class LabelSmoothing(nn.Module):
             tensor.detach():
             Returns a new Tensor, detached from the current graph. The result will never require gradient
             """
-            true_dist.index_fill_(dim=0, index=mask_indexs.squeeze(), value=0.0) # 在mask 的地方赋值0
-        self.true_dist = true_dist
+            smoothed_target_dist.index_fill_(dim=0, index=mask_indexs.squeeze(), value=0.0) # 在mask 的地方赋值0
+        self.smoothed_target_dist = smoothed_target_dist
+        # 用平滑后的smoothed_target_dist标签与预测值计算loss
+        # pred_scores:[batch*(seq_len-1), vocab]
+        # smoothed_target_dist:[batch*(seq_len-1), vocab]
         # out:[1]
-        out = self.kldiv_loss(input=pred_scores, target=true_dist.clone().detach())
+        out = self.kldiv_loss.forward(input=pred_scores, target=smoothed_target_dist.clone().detach())
         return out
 
 # > This code predicts a translation using greedy decoding for simplicity.
@@ -625,15 +688,15 @@ def greedy_decode(model:EncoderDecoder, src:Tensor, src_mask:Tensor, max_len:int
 N: layer number
 注意：feedforward一般比d_model大很多
 """
-def make_model(src_vocab_size:int, tgt_vocab_size:int, N=6, d_model=512, d_ff=2048, head_num=8, dropout=0.1):
+def make_model(src_vocab_size:int, tgt_vocab_size:int, layer_num=6, d_model=512, d_ff=2048, head_num=8, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     multi_attention = MultiHeadedAttention(head_num, d_model)
     feed_forward = PositionWiseFeedForward(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
     model = EncoderDecoder(
-        encoder=Encoders(EncoderLayer(d_model, c(multi_attention), c(feed_forward), dropout), N),
-        decoder=Decoders(DecoderLayer(d_model, c(multi_attention), c(multi_attention), c(feed_forward), dropout), N),
+        encoder=Encoders(EncoderLayer(d_model, c(multi_attention), c(feed_forward), dropout), layer_num),
+        decoder=Decoders(DecoderLayer(d_model, c(multi_attention), c(multi_attention), c(feed_forward), dropout), layer_num),
         # src_embed=nn.Sequential(VocabEmbedding(d_model, src_vocab_size),c(position)),
         # tgt_embed=nn.Sequential(VocabEmbedding(d_model, tgt_vocab_size),c(position)),
         # 注意：src, tgt并没有共享embedding,因为它们的embedding size不一样
@@ -705,7 +768,7 @@ class SimpleLossCompute:
     def __call__(self, model_out, y_ids, norm:float):
         # model_out:[batch, seq_len-1, d_model]
         # predict:[batch, seq_len-1, vocab]
-        predict = self.generator(model_out)
+        predict = self.generator(model_out) # 注意：其输出已经是log域
         # predict:[batch, seq_len-1, vocab]
         #      => [batch*(seq_len-1), vocab]
         # y_ids: [batch, seq_len-1]
@@ -717,7 +780,7 @@ class SimpleLossCompute:
 def run_epoch(data_iter, model:EncoderDecoder,
               loss_compute:SimpleLossCompute,
               optimizer:torch.optim.Optimizer,
-              scheduler,
+              scheduler:Union[LambdaLR, Any],
               mode="train",
               accum_iter=1,
               train_state=TrainState(),):
@@ -779,6 +842,20 @@ import matplotlib.pyplot as plt
 f=np.frompyfunc(lambda a:rate(a, model_size=512, factor=1.0, warmup=400),1,1)
 y=f(x)
 plt.plot(x,y)
+
+
+同时，我们可以测试一下为啥是先增后减
+warmup=4000, factor=1
+
+x=np.arange(0,10000)
+f1=np.frompyfunc(lambda x: x * 4000 ** (-1.5) if a>0 else np.NaN,1,1)
+f2=np.frompyfunc(lambda x: x ** (-0.5) if a>0 else np.NaN,1,1)
+#plt.plot(x,f1(x),f2(x))
+plt.plot(x,f1(x), label='x * 4000 ** (-1.5)')
+plt.plot(x,f2(x), label='x ** (-0.5)')
+plt.legend()
+当step=warmup=4000时，f1=step**(-0.5), f2=step*warmup**(-1.5)=step**(-0.5)，
+即当step=warmup时，f1 = f2,两曲线会相交，lr先线性递增，后面非线性递减
 """
 def rate(step:int, model_size:int, factor:float, warmup:int):
     """
@@ -787,30 +864,26 @@ def rate(step:int, model_size:int, factor:float, warmup:int):
     """
     if step == 0:
         step = 1
-    return factor * ( model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5)) )
+    return factor * ( model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5)))
 
+#
 # ## Data Loading
 #
-# > We will load the dataset using torchtext and spacy for
-# > tokenization.
+# > We will load the dataset using torchtext and spacy for tokenization.
 
-# %%
-# Load spacy tokenizer models, download them if they haven't been
-# downloaded already
-
+# Load spacy tokenizer models, download them if they haven't been downloaded already
 def load_tokenizers():
-    import spacy
-    try:
-        spacy_de = spacy.load("de_core_news_sm")
-    except IOError:
-        os.system("python -m spacy download de_core_news_sm")
-        spacy_de = spacy.load("de_core_news_sm")
 
     try:
-        spacy_en = spacy.load("en_core_web_sm")
+        spacy_en:Language = spacy.load("en_core_web_sm")
     except IOError:
         os.system("python -m spacy download en_core_web_sm")
         spacy_en = spacy.load("en_core_web_sm")
+    try:
+        spacy_de:Language = spacy.load("de_core_news_sm")
+    except IOError:
+        os.system("python -m spacy download de_core_news_sm")
+        spacy_de = spacy.load("de_core_news_sm")
 
     return spacy_de, spacy_en
 
@@ -820,19 +893,23 @@ def tokenize(text, tokenizer):
     return [tok.text for tok in tokenizer.tokenizer(text)]
 
 
-def yield_tokens(data_iter, tokenizer, index):
+def yield_tokens(data_iter, tokenizer:Language, index):
     for from_to_tuple in data_iter:
         yield tokenizer(from_to_tuple[index])
 
 
-def build_vocabulary(spacy_de, spacy_en):
+def build_vocabulary(spacy_de:Language, spacy_en:Language):
     def tokenize_de(text):
         return tokenize(text, spacy_de)
 
     def tokenize_en(text):
         return tokenize(text, spacy_en)
 
+    # de -> en
     print("Building German Vocabulary ...")
+    # - train: 29000
+    # - valid: 1014
+    # - test: 1000
     train, val, test = datasets.Multi30k(language_pair=("de", "en"))
     vocab_src = build_vocab_from_iterator(
         yield_tokens(train + val + test, tokenize_de, index=0),
@@ -847,53 +924,53 @@ def build_vocabulary(spacy_de, spacy_en):
         min_freq=2,
         specials=["<s>", "</s>", "<blank>", "<unk>"],
     )
-
+    # 设置unk为default
     vocab_src.set_default_index(vocab_src["<unk>"])
     vocab_tgt.set_default_index(vocab_tgt["<unk>"])
 
     return vocab_src, vocab_tgt
 
-
-def load_vocab(spacy_de, spacy_en):
+def load_vocab(spacy_de:Language, spacy_en:Language):
     if not exists("vocab.pt"):
         vocab_src, vocab_tgt = build_vocabulary(spacy_de, spacy_en)
         torch.save((vocab_src, vocab_tgt), "vocab.pt")
     else:
         vocab_src, vocab_tgt = torch.load("vocab.pt")
     print("Finished.\nVocabulary sizes:")
-    print(len(vocab_src))
-    print(len(vocab_tgt))
+    print("src(de) vocab size:", len(vocab_src)) # 8315
+    print("tgt(en) vocab size", len(vocab_tgt)) # 6384
     return vocab_src, vocab_tgt
 
-
+# 为每个batch寻找需要最小padding的样本,以加快训练速度
 def collate_batch(
-    batch,
-    src_pipeline,
-    tgt_pipeline,
-    src_vocab,
-    tgt_vocab,
-    device,
-    max_padding=128,
-    pad_id=2,
-):
-    bs_id = torch.tensor([0], device=device)  # <s> token id
-    eos_id = torch.tensor([1], device=device)  # </s> token id
+        batch:List[List[str]],
+        src_pipeline:callable,
+        tgt_pipeline:callable,
+        src_vocab:Vocab,
+        tgt_vocab:Vocab,
+        device:int,
+        max_padding:int=128,
+        pad_id:int=2):
+
+    bs_id = torch.tensor([0], device=device)  # <s> token id, begin of sentence = 0
+    eos_id = torch.tensor([1], device=device)  # </s> token id, end of sentence = 1
     src_list, tgt_list = [], []
+
+    # _src:[germany_str], "'Sieben Kinder springen auf einer Wiese.'"
+    # _tgt:[english_str], "'Seven children are jumping in a grassy meadow.'"
     for (_src, _tgt) in batch:
-        processed_src = torch.cat(
-            [
-                bs_id,
+        processed_src = torch.cat([
+                bs_id, # <s>
                 torch.tensor(
                     src_vocab(src_pipeline(_src)),
                     dtype=torch.int64,
                     device=device,
                 ),
-                eos_id,
+                eos_id, # </s>
             ],
-            0,
-        )
-        processed_tgt = torch.cat(
-            [
+            dim=0, )
+
+        processed_tgt = torch.cat([
                 bs_id,
                 torch.tensor(
                     tgt_vocab(tgt_pipeline(_tgt)),
@@ -902,38 +979,29 @@ def collate_batch(
                 ),
                 eos_id,
             ],
-            0,
-        )
+            dim=0, )
+
+        # warning - overwrites values for negative values of padding - len
         src_list.append(
-            # warning - overwrites values for negative values of padding - len
-            pad(
-                processed_src,
-                (
-                    0,
-                    max_padding - len(processed_src),
-                ),
-                value=pad_id,
-            )
-        )
+            pad(input=processed_src, # 注意：padding是在<s> </s>之后的
+                pad=(0, max_padding - len(processed_src), ), # [batch, seq_len] 只在最后一个维度进行padding,即seq的尾部用pad_id进行padding
+                value=pad_id,))
+
         tgt_list.append(
-            pad(
-                processed_tgt,
-                (0, max_padding - len(processed_tgt)),
-                value=pad_id,
-            )
-        )
+            pad(input=processed_tgt,
+                pad=(0, max_padding - len(processed_tgt)),
+                value=pad_id,))
 
     src = torch.stack(src_list)
     tgt = torch.stack(tgt_list)
     return (src, tgt)
 
-
 def create_dataloaders(
-    device,
-    vocab_src,
-    vocab_tgt,
-    spacy_de,
-    spacy_en,
+    gpu_device_id:int,
+    vocab_src:Vocab,
+    vocab_tgt:Vocab,
+    spacy_de:Language,
+    spacy_en:Language,
     batch_size=12000,
     max_padding=128,
     is_distributed=True,
@@ -952,33 +1020,30 @@ def create_dataloaders(
             tokenize_en,
             vocab_src,
             vocab_tgt,
-            device,
+            gpu_device_id,
             max_padding=max_padding,
             pad_id=vocab_src.get_stoi()["<blank>"],
         )
 
+    # training, development, test data
     train_iter, valid_iter, test_iter = datasets.Multi30k( language_pair=("de", "en") )
 
-    train_iter_map = to_map_style_dataset(
-        train_iter
-    )  # DistributedSampler needs a dataset len()
-    train_sampler = (
-        DistributedSampler(train_iter_map) if is_distributed else None
-    )
+    # Convert iterable-style dataset to map-style dataset.
+    train_iter_map = to_map_style_dataset(train_iter)  # DistributedSampler needs a dataset len()
+    train_sampler = ( DistributedSampler(train_iter_map) if is_distributed else None )
     valid_iter_map = to_map_style_dataset(valid_iter)
-    valid_sampler = (
-        DistributedSampler(valid_iter_map) if is_distributed else None
-    )
+    valid_sampler = ( DistributedSampler(valid_iter_map) if is_distributed else None )
 
     train_dataloader = DataLoader(
-        train_iter_map,
+        dataset=train_iter_map,
         batch_size=batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         collate_fn=collate_fn,
     )
+
     valid_dataloader = DataLoader(
-        valid_iter_map,
+        dataset=valid_iter_map,
         batch_size=batch_size,
         shuffle=(valid_sampler is None),
         sampler=valid_sampler,
@@ -986,46 +1051,40 @@ def create_dataloaders(
     )
     return train_dataloader, valid_dataloader
 
-
-
-# %% [markdown] id="90qM8RzCTsqM"
 # ## Training the System
-
-# %%
 def train_worker(
-    gpu,
-    ngpus_per_node,
-    vocab_src,
-    vocab_tgt,
-    spacy_de,
-    spacy_en,
-    config,
+    gpu_id:int,
+    ngpus_per_node:int,
+    vocab_src:Vocab,
+    vocab_tgt:Vocab,
+    spacy_de:Language,
+    spacy_en:Language,
+    config:dict,
     is_distributed=False,
 ):
-    print(f"Train worker process using GPU: {gpu} for training", flush=True)
-    torch.cuda.set_device(gpu)
+    print(f"Train worker process using GPU: {gpu_id} for training", flush=True)
+    torch.cuda.set_device(gpu_id)
 
-    pad_idx = vocab_tgt["<blank>"]
+    pad_idx = vocab_tgt["<blank>"] # 用blank进行padding吗？
     d_model = 512
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
-    model.cuda(gpu)
+    model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt), layer_num=6)
+    model.cuda(gpu_id)
+
     module = model
     is_main_process = True
     if is_distributed:
         dist.init_process_group(
-            "nccl", init_method="env://", rank=gpu, world_size=ngpus_per_node
+            "nccl", init_method="env://", rank=gpu_id, world_size=ngpus_per_node
         )
-        model = DDP(model, device_ids=[gpu])
+        model = DDP(model, device_ids=[gpu_id])
         module = model.module
-        is_main_process = gpu == 0
+        is_main_process = gpu_id == 0
 
-    criterion = LabelSmoothing(
-        vocab_size=len(vocab_tgt), padding_idx=pad_idx, smoothing=0.1
-    )
-    criterion.cuda(gpu)
+    criterion = LabelSmoothing(vocab_size=len(vocab_tgt), padding_idx=pad_idx, smoothing=0.1)
+    criterion.cuda(gpu_id)
 
     train_dataloader, valid_dataloader = create_dataloaders(
-        gpu,
+        gpu_id,
         vocab_src,
         vocab_tgt,
         spacy_de,
@@ -1035,14 +1094,10 @@ def train_worker(
         is_distributed=is_distributed,
     )
 
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=config["base_lr"], betas=(0.9, 0.98), eps=1e-9
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["base_lr"], betas=(0.9, 0.98), eps=1e-9)
     lr_scheduler = LambdaLR(
         optimizer=optimizer,
-        lr_lambda=lambda step: rate(
-            step, d_model, factor=1, warmup=config["warmup"]
-        ),
+        lr_lambda=lambda step: rate(step, d_model, factor=1, warmup=config["warmup"]),
     )
     train_state = TrainState()
 
@@ -1052,9 +1107,9 @@ def train_worker(
             valid_dataloader.sampler.set_epoch(epoch)
 
         model.train()
-        print(f"[GPU{gpu}] Epoch {epoch} Training ====", flush=True)
+        print(f"[GPU{gpu_id}] Epoch {epoch} Training ====", flush=True)
         _, train_state = run_epoch(
-            (Batch(b[0], b[1], pad_idx) for b in train_dataloader),
+            (Batch(src=b[0], tgt=b[1], pad=pad_idx) for b in train_dataloader),
             model,
             SimpleLossCompute(module.generator, criterion),
             optimizer,
@@ -1067,12 +1122,13 @@ def train_worker(
         GPUtil.showUtilization()
         if is_main_process:
             file_path = "%s%.2d.pt" % (config["file_prefix"], epoch)
-            torch.save(module.state_dict(), file_path)
-        torch.cuda.empty_cache()
+            torch.save(module.state_dict(), file_path) #保存模型
 
-        print(f"[GPU{gpu}] Epoch {epoch} Validation ====", flush=True)
+        torch.cuda.empty_cache() # Releases all unoccupied cached memory currently held by the caching
+
+        print(f"[GPU{gpu_id}] Epoch {epoch} Validation ====", flush=True)
         model.eval()
-        sloss = run_epoch(
+        sloss, _ = run_epoch(
             (Batch(b[0], b[1], pad_idx) for b in valid_dataloader),
             model,
             SimpleLossCompute(module.generator, criterion),
@@ -1087,37 +1143,34 @@ def train_worker(
         file_path = "%sfinal.pt" % config["file_prefix"]
         torch.save(module.state_dict(), file_path)
 
-
-# %% tags=[]
-def train_distributed_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config):
-    from origin.the_annotated_transformer import train_worker
-
+def train_distributed_model(vocab_src, vocab_tgt, spacy_de:Language, spacy_en:Language, config:dict):
     ngpus = torch.cuda.device_count()
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12356"
     print(f"Number of GPUs detected: {ngpus}")
     print("Spawning training processes ...")
     mp.spawn(
-        train_worker,
+        fn=train_worker,
         nprocs=ngpus,
         args=(ngpus, vocab_src, vocab_tgt, spacy_de, spacy_en, config, True),
     )
 
 
-def train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config):
+def train_model(vocab_src:Vocab, vocab_tgt:Vocab, spacy_de:Language, spacy_en:Language, config:dict):
     if config["distributed"]:
-        train_distributed_model(
-            vocab_src, vocab_tgt, spacy_de, spacy_en, config
-        )
+        train_distributed_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config)
     else:
-        train_worker(
-            0, 1, vocab_src, vocab_tgt, spacy_de, spacy_en, config, False
-        )
+        train_worker(0, 1, vocab_src, vocab_tgt, spacy_de, spacy_en, config, False)
 
 
-def load_trained_model():
+def load_or_train_model():
+    print("begin to load or train model")
+    spacy_de, spacy_en = load_tokenizers()
+    vocab_src, vocab_tgt = load_vocab(spacy_de, spacy_en)
+
     config = {
-        "batch_size": 32,
+        #"batch_size": 32, # 内存超限
+        "batch_size": 2,
         "distributed": False,
         "num_epochs": 8,
         "accum_iter": 10,
@@ -1128,27 +1181,33 @@ def load_trained_model():
     }
     model_path = "multi30k_model_final.pt"
     if not exists(model_path):
+        print(f"not exists train model:{model_path}, begin to train")
         train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config)
 
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
-    model.load_state_dict(torch.load("multi30k_model_final.pt"))
+    model = make_model(len(vocab_src), len(vocab_tgt), layer_num=6)
+    model.load_state_dict(torch.load(model_path))
     return model
 
+"""
+Shared Embeddings
+When using BPE with shared vocabulary we can share the same
+weight vectors between the source / target / generator. See the (cite) (cite) (cite) (cite) for details. To
+add this to the model simply do this:
+"""
 # if False:
-#     model.src_embed[0].lut.weight = model.tgt_embeddings[0].lut.weight
+#     model.src_embed[0].lut.weight = model.tgt_embeddings[0].lut.weight # lut:lookup_table
 #     model.generator.lut.weight = model.tgt_embed[0].lut.weight
 
-
-# %% id="hAFEa78JokDB"
+"""
+The paper averages the last k checkpoints to create an ensembling
+effect. We can do this after the fact if we have a bunch of models
+"""
 def average(model, models):
     "Average models into model"
     for ps in zip(*[m.params() for m in [model] + models]):
-        ps[0].copy_(torch.sum(*ps[1:]) / len(ps[1:]))
-
+        ps[0].copy_(src=torch.sum(*ps[1:]) / len(ps[1:]))
 
 # Load data and model for output checks
-
-# %%
 def check_outputs(
     valid_dataloader,
     model,
@@ -1163,7 +1222,7 @@ def check_outputs(
         print("\nExample %d ========\n" % idx)
         b = next(iter(valid_dataloader))
         rb = Batch(b[0], b[1], pad_idx)
-        greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0]
+        ys = greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0]
 
         src_tokens = [
             vocab_src.get_itos()[x] for x in rb.src[0] if x != pad_idx
@@ -1192,11 +1251,7 @@ def check_outputs(
     return results
 
 
-
 # execute_example(run_model_example)
-
-
-# %% [markdown] id="0ZkkNTKLTsqO"
 # ## Attention Visualization
 #
 # > Even with a greedy decoders the translation looks pretty good. We
@@ -1204,7 +1259,7 @@ def check_outputs(
 # > the attention
 
 # %%
-def mtx2df(m, max_row, max_col, row_tokens, col_tokens):
+def matrix_to_dataframe(m:Tensor, max_row:int, max_col:int, row_tokens:dict, col_tokens:dict):
     "convert a dense matrix to a data frame with row and column indices"
     return pd.DataFrame(
         [
@@ -1226,8 +1281,8 @@ def mtx2df(m, max_row, max_col, row_tokens, col_tokens):
     )
 
 
-def attn_map(attn, layer, head, row_tokens, col_tokens, max_dim=30):
-    df = mtx2df(
+def attn_map(attn:Tensor, layer, head:int, row_tokens:dict, col_tokens:dict, max_dim=30):
+    df = matrix_to_dataframe(
         attn[0, head].data,
         max_dim,
         max_dim,
@@ -1248,7 +1303,6 @@ def attn_map(attn, layer, head, row_tokens, col_tokens, max_dim=30):
     )
 
 
-# %% tags=[]
 def get_encoder(model, layer):
     return model.encoder.layers[layer].self_attn.attn
 
@@ -1259,7 +1313,6 @@ def get_decoder_self(model, layer):
 
 def get_decoder_src(model, layer):
     return model.decoder.layers[layer].src_attn.attn
-
 
 def visualize_layer(model, layer, getter_fn, ntokens, row_tokens, col_tokens):
     # ntokens = last_example[0].ntokens
@@ -1288,4 +1341,3 @@ def visualize_layer(model, layer, getter_fn, ntokens, row_tokens, col_tokens):
         # | charts[7]
         # layer + 1 due to 0-indexing
     ).properties(title="Layer %d" % (layer + 1))
-
