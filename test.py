@@ -1,4 +1,5 @@
 import os
+from typing import Optional,Union,Any,List,Tuple
 from os.path import exists
 import numpy as np
 import torch
@@ -345,9 +346,10 @@ def example_simple_copy_model():
     print("greedy_decode:", pred)
     print("acc:", (src==pred).sum()/np.prod(src.shape))
 
-
-def run_model_example(n_examples=5):
-    global vocab_src, vocab_tgt, spacy_de, spacy_en
+def run_model_example(n_examples=5)->Tuple[EncoderDecoder, List[Tuple[str]]]:
+    #global vocab_src, vocab_tgt, spacy_de, spacy_en
+    spacy_de, spacy_en = load_tokenizers()
+    vocab_src, vocab_tgt = load_vocab(spacy_de, spacy_en)
 
     print("Preparing Data ...")
     _, valid_dataloader = create_dataloaders(
@@ -362,24 +364,24 @@ def run_model_example(n_examples=5):
 
     print("Loading Trained Model ...")
     # 加载模型进行预测
-    model = make_model(len(vocab_src), len(vocab_tgt), layer_num=6)
-    model.load_state_dict(
-        torch.load("multi30k_model_final.pt", map_location=torch.device("cpu"))
-    )
+    #model = make_model(len(vocab_src), len(vocab_tgt), layer_num=6)
+    config = get_model_config()
+    model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
+                       layer_num=config['layer_num'], d_model=config['d_model'], d_ff=config['d_ff'], head_num=config['head_num'])
+    model.load_state_dict(torch.load("multi30k_model_final.pt", map_location=torch.device("cpu")) )
 
     print("Checking Model Outputs:")
-    example_data = check_outputs(
-        valid_dataloader, model, vocab_src, vocab_tgt, n_examples=n_examples
-    )
+    example_data = check_outputs(valid_dataloader, model, vocab_src, vocab_tgt, n_examples=n_examples)
     return model, example_data
 
 
 # %% tags=[]
 def viz_encoder_self():
+    """
+    # example_data: List[(batch_ids, src_tokens, tgt_tokens, model_out, model_txt)]
+    """
     model, example_data = run_model_example(n_examples=1)
-    example = example_data[
-        len(example_data) - 1
-        ]  # batch object for the final example
+    example = example_data[len(example_data) - 1]  # batch object for the final example
 
     layer_viz = [
         visualize_layer(
@@ -457,10 +459,208 @@ def test_loss():
     data = torch.cat([loss(x, crit).reshape(1,1) for x in range(1, 100)], dim=1)
     print(data)
 
+def get_model_config():
+    # 原始论文配置
+    # "batch_size": 32, # 原始论文设置，内存超限
+    # "num_epochs": 8,
+    # d_model = 512
+    # d_ff = 2048
+    # head_num = 8
+    # layer_num = 6
+    config = {
+        "batch_size": 100,
+        "num_epochs": 1,
+        "d_model":10,
+        "d_ff":20,
+        "head_num":2,
+        "layer_num":1,
+        "distributed": False,
+        "accum_iter": 10,
+        "base_lr": 1.0,
+        "max_padding": 72,
+        "warmup": 3000,
+        "file_prefix": "multi30k_model_",
+    }
+    return config
+
+def load_or_train_model():
+    print("begin to load or train model")
+    spacy_de, spacy_en = load_tokenizers()
+    vocab_src, vocab_tgt = load_vocab(spacy_de, spacy_en)
+
+    config = get_model_config()
+    model_path = "multi30k_model_final.pt"
+    #if not exists(model_path):
+    if True:
+        print(f"not exists train model:{model_path}, begin to train")
+        train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config)
+    else:
+        print(f"load model from:{model_path}")
+
+    model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
+                       layer_num=config['layer_num'], d_model=config['d_model'], d_ff=config['d_ff'], head_num=config['head_num'])
+
+    model.load_state_dict(torch.load(model_path))
+    return model
+
+"""
+Shared Embeddings
+When using BPE with shared vocabulary we can share the same
+weight vectors between the source / target / generator. See the (cite) (cite) (cite) (cite) for details. To
+add this to the model simply do this:
+"""
+# if False:
+#     model.src_embed[0].lut.weight = model.tgt_embeddings[0].lut.weight # lut:lookup_table
+#     model.generator.lut.weight = model.tgt_embed[0].lut.weight
+
+"""
+The paper averages the last k checkpoints to create an ensembling
+effect. We can do this after the fact if we have a bunch of models
+"""
+def average(model, models):
+    "Average models into model"
+    for ps in zip(*[m.params() for m in [model] + models]):
+        ps[0].copy_(src=torch.sum(*ps[1:]) / len(ps[1:]))
+
+# Load data and model for output checks
+def check_outputs(
+        valid_dataloader,
+        model:EncoderDecoder,
+        vocab_src:Vocab,
+        vocab_tgt:Vocab,
+        n_examples=15,
+        pad_idx=2,
+        eos_string="</s>",
+):
+    results = [()] * n_examples
+    for idx in range(n_examples):
+        print("\nExample %d ========\n" % idx)
+        # dataloader:返回(src_ids, tgt_ids)
+        b = next(iter(valid_dataloader))
+        rb = Batch(src=b[0], tgt=b[1], pad=pad_idx)
+        ys = greedy_decode(model, rb.src, rb.src_mask, max_len=64, start_symbol=0)[0]
+
+        src_tokens = [vocab_src.get_itos()[x] for x in rb.src[0] if x != pad_idx ]
+        tgt_tokens = [vocab_tgt.get_itos()[x] for x in rb.tgt[0] if x != pad_idx ]
+
+        print( "Source Text (Input)        : " + " ".join(src_tokens).replace("\n", "") )
+        print( "Target Text (Ground Truth) : " + " ".join(tgt_tokens).replace("\n", "") )
+
+        model_out = greedy_decode(model, rb.src, rb.src_mask, max_len=72, start_symbol=0)[0]
+        model_txt = (
+                " ".join(
+                    [vocab_tgt.get_itos()[x] for x in model_out if x != pad_idx]
+                ).split(eos_string, maxsplit=1)[0]
+                + eos_string
+        )
+        print("Model Output               : " + model_txt.replace("\n", ""))
+        results[idx] = (rb, src_tokens, tgt_tokens, model_out, model_txt)
+
+    return results
+
+
+# execute_example(run_model_example)
+# ## Attention Visualization
+#
+# > Even with a greedy decoders the translation looks pretty good. We
+# > can further visualize it to see what is happening at each layer of
+# > the attention
+
+# %%
+def matrix_to_dataframe(m:Tensor, max_row:int, max_col:int, row_tokens:dict, col_tokens:dict):
+    "convert a dense matrix to a data frame with row and column indices"
+    return pd.DataFrame(
+        [
+            (
+                r,
+                c,
+                float(m[r, c]),
+                "%.3d %s"
+                % (r, row_tokens[r] if len(row_tokens) > r else "<blank>"), # <blank>是padding字符
+                "%.3d %s"
+                % (c, col_tokens[c] if len(col_tokens) > c else "<blank>"),
+            )
+            for r in range(m.shape[0])
+            for c in range(m.shape[1])
+            if r < max_row and c < max_col
+        ],
+        # if float(m[r,c]) != 0 and r < max_row and c < max_col],
+        columns=["row", "column", "value", "row_token", "col_token"],
+    )
+
+
+def attn_map(attn:Tensor, layer, head:int, row_tokens:dict, col_tokens:dict, max_dim=30):
+    df = matrix_to_dataframe(
+        attn[0, head].data,
+        max_dim,
+        max_dim,
+        row_tokens,
+        col_tokens,
+    )
+    chart = (
+        alt.Chart(data=df)
+            .mark_rect()
+            .encode(
+            x=alt.X("col_token", axis=alt.Axis(title="")),
+            y=alt.Y("row_token", axis=alt.Axis(title="")),
+            color="value",
+            tooltip=["row", "column", "value", "row_token", "col_token"],
+        )
+            .properties(height=400, width=400)
+            .interactive()
+    )
+    chart.save("images/attn_map.html")
+    return chart
+
+
+def get_encoder(model:EncoderDecoder, layer:int):
+    return model.encoders.layers[layer].self_attn.attn
+
+
+def get_decoder_self(model:EncoderDecoder, layer:int):
+    return model.decoders.layers[layer].self_attn.attn
+
+
+def get_decoder_src(model:EncoderDecoder, layer:int):
+    return model.decoders.layers[layer].src_attn.attn
+
+def visualize_layer(model:EncoderDecoder, layer:int, get_attn_map_fn:callable,
+                    ntokens:int,
+                    row_tokens,
+                    col_tokens):
+    # ntokens = last_example[0].ntokens
+    attn = get_attn_map_fn(model, layer)
+    n_heads = attn.shape[1]
+    charts = [
+        attn_map(
+            attn,
+            0,
+            h,
+            row_tokens=row_tokens,
+            col_tokens=col_tokens,
+            max_dim=ntokens,
+        )
+        for h in range(n_heads)
+    ]
+    assert n_heads == 8
+    return alt.vconcat(
+        charts[0]
+        # | charts[1]
+        | charts[2]
+        # | charts[3]
+        | charts[4]
+        # | charts[5]
+        | charts[6]
+        # | charts[7]
+        # layer + 1 due to 0-indexing
+    ).properties(title="Layer %d" % (layer + 1))
+
 if __name__ == '__main__':
-    load_or_train_model()
+    viz_encoder_self()
 
     if False:
+        load_or_train_model()
+        run_model_example()
         run_de_translate_to_en()
         load_tokenizers()
         example_simple_copy_model()
@@ -471,10 +671,10 @@ if __name__ == '__main__':
         inference_test()
         example_mask()
         run_model_example()
-    # model = load_trained_model()
-    # run_de_translate_to_en()
-    # show_example(viz_decoder_src)
-    # show_example(run_tests)
-    # show_example(penalization_visualization)
-    # show_example(example_label_smoothing)
-    # show_example(example_positional)
+        # model = load_trained_model()
+        # run_de_translate_to_en()
+        # show_example(viz_decoder_src)
+        # show_example(run_tests)
+        # show_example(penalization_visualization)
+        # show_example(example_label_smoothing)
+        # show_example(example_positional)

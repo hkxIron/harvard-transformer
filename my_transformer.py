@@ -16,7 +16,7 @@ import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
-from typing import Optional,Union,Any,List
+from typing import Optional,Union,Any,List,Tuple
 from torch._tensor import Tensor
 # alt.renderers.enable('notebook')
 # alt.renderers.enable('mimetype')
@@ -191,7 +191,8 @@ class MultiHeadedAttention(nn.Module):
         self.h = head_num
         # 注意有4个linear + query + key+ value + attenion之后
         self.linears = clones(nn.Linear(in_features=d_model, out_features=d_model, bias=True), 4)
-        self.attn = None # 这个只是用来debug显示attention_map图的
+        # attn: [batch, head, seq_len, seq_len]
+        self.attn:Optional[Tensor] = None # 这个只是用来debug显示attention_map图的
         self.dropout = nn.Dropout(p=dropout)
 
     # query:[batch, seq_len, d_model]
@@ -313,7 +314,7 @@ class Encoders(nn.Module):
 
     def __init__(self, layer:EncoderLayer, N:int=6):
         super(Encoders, self).__init__()
-        self.layers:nn.ModuleList = clones(layer, N)
+        self.layers:nn.ModuleList[EncoderLayer] = clones(layer, N)
         self.norm = LayerNorm(features=layer.size)
 
     # x:[batch, seq_len, d_model]
@@ -416,7 +417,7 @@ class Decoders(nn.Module):
 
     def __init__(self, layer:DecoderLayer, N:int):
         super(Decoders, self).__init__()
-        self.layers:nn.ModuleList = clones(layer, N)
+        self.layers:nn.ModuleList[DecoderLayer] = clones(layer, N)
         self.norm = LayerNorm(features=layer.size)
 
     # x:[batch, seq_len-1, d_model]
@@ -433,7 +434,11 @@ class EncoderDecoder(nn.Module):
     A standard Encoder-Decoder architecture. Base for this and many
     other models.
     """
-    def __init__(self, encoder:Encoders, decoder:Decoders, src_embed:EmbeddingPlusPositionEncoding, tgt_embed:EmbeddingPlusPositionEncoding, generator:Generator):
+    def __init__(self, encoder:Encoders,
+                 decoder:Decoders,
+                 src_embed:EmbeddingPlusPositionEncoding,
+                 tgt_embed:EmbeddingPlusPositionEncoding,
+                 generator:Generator):
         super(EncoderDecoder, self).__init__()
         self.encoders:Encoders = encoder
         self.decoders:Decoders = decoder
@@ -688,7 +693,7 @@ def greedy_decode(model:EncoderDecoder, src:Tensor, src_mask:Tensor, max_len:int
 N: layer number
 注意：feedforward一般比d_model大很多
 """
-def make_model(src_vocab_size:int, tgt_vocab_size:int, layer_num=6, d_model=512, d_ff=2048, head_num=8, dropout=0.1):
+def make_model(src_vocab_size:int, tgt_vocab_size:int, layer_num=6, d_model=512, d_ff=2048, head_num=8, dropout=0.1)->EncoderDecoder:
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     multi_attention = MultiHeadedAttention(head_num, d_model)
@@ -948,7 +953,7 @@ def collate_batch(
         tgt_pipeline:callable,
         src_vocab:Vocab,
         tgt_vocab:Vocab,
-        device:int,
+        device: Union[int, str, torch.device],
         max_padding:int=128,
         pad_id:int=2):
 
@@ -959,10 +964,10 @@ def collate_batch(
     # _src:[germany_str], "'Sieben Kinder springen auf einer Wiese.'"
     # _tgt:[english_str], "'Seven children are jumping in a grassy meadow.'"
     for (_src, _tgt) in batch:
-        processed_src = torch.cat([
+        processed_src_ids = torch.cat([
                 bs_id, # <s>
                 torch.tensor(
-                    src_vocab(src_pipeline(_src)),
+                    src_vocab(src_pipeline(_src)), # 先进行tokenlizer,然后将str -> id
                     dtype=torch.int64,
                     device=device,
                 ),
@@ -970,7 +975,7 @@ def collate_batch(
             ],
             dim=0, )
 
-        processed_tgt = torch.cat([
+        processed_tgt_ids = torch.cat([
                 bs_id,
                 torch.tensor(
                     tgt_vocab(tgt_pipeline(_tgt)),
@@ -983,21 +988,21 @@ def collate_batch(
 
         # warning - overwrites values for negative values of padding - len
         src_list.append(
-            pad(input=processed_src, # 注意：padding是在<s> </s>之后的
-                pad=(0, max_padding - len(processed_src), ), # [batch, seq_len] 只在最后一个维度进行padding,即seq的尾部用pad_id进行padding
-                value=pad_id,))
+            pad(input=processed_src_ids,  # 注意：padding是在<s> </s>之后的
+                pad=(0, max_padding - len(processed_src_ids),),  # [batch, seq_len] 只在最后一个维度进行padding,即seq的尾部用pad_id进行padding
+                value=pad_id, ))
 
         tgt_list.append(
-            pad(input=processed_tgt,
-                pad=(0, max_padding - len(processed_tgt)),
-                value=pad_id,))
+            pad(input=processed_tgt_ids,
+                pad=(0, max_padding - len(processed_tgt_ids)),
+                value=pad_id, ))
 
     src = torch.stack(src_list)
     tgt = torch.stack(tgt_list)
     return (src, tgt)
 
 def create_dataloaders(
-    gpu_device_id:int,
+    device:Union[int, str, torch.device],
     vocab_src:Vocab,
     vocab_tgt:Vocab,
     spacy_de:Language,
@@ -1020,20 +1025,21 @@ def create_dataloaders(
             tokenize_en,
             vocab_src,
             vocab_tgt,
-            gpu_device_id,
+            device,
             max_padding=max_padding,
             pad_id=vocab_src.get_stoi()["<blank>"],
         )
 
     # training, development, test data
-    train_iter, valid_iter, test_iter = datasets.Multi30k( language_pair=("de", "en") )
+    train_iter, valid_iter, test_iter = datasets.Multi30k(language_pair=("de", "en"))
 
     # Convert iterable-style dataset to map-style dataset.
     train_iter_map = to_map_style_dataset(train_iter)  # DistributedSampler needs a dataset len()
-    train_sampler = ( DistributedSampler(train_iter_map) if is_distributed else None )
+    train_sampler = (DistributedSampler(train_iter_map) if is_distributed else None )
     valid_iter_map = to_map_style_dataset(valid_iter)
-    valid_sampler = ( DistributedSampler(valid_iter_map) if is_distributed else None )
+    valid_sampler = (DistributedSampler(valid_iter_map) if is_distributed else None )
 
+    # dataloader:返回(src_ids, tgt_ids)
     train_dataloader = DataLoader(
         dataset=train_iter_map,
         batch_size=batch_size,
@@ -1042,6 +1048,7 @@ def create_dataloaders(
         collate_fn=collate_fn,
     )
 
+    # dataloader:返回(src_ids, tgt_ids)
     valid_dataloader = DataLoader(
         dataset=valid_iter_map,
         batch_size=batch_size,
@@ -1054,7 +1061,7 @@ def create_dataloaders(
 # ## Training the System
 def train_worker(
     gpu_id:int,
-    ngpus_per_node:int,
+    ngpus_per_node:int, # 每个节点的gpu数
     vocab_src:Vocab,
     vocab_tgt:Vocab,
     spacy_de:Language,
@@ -1065,24 +1072,29 @@ def train_worker(
     print(f"Train worker process using GPU: {gpu_id} for training", flush=True)
     torch.cuda.set_device(gpu_id)
 
-    pad_idx = vocab_tgt["<blank>"] # 用blank进行padding吗？
-    d_model = 512
-    model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt), layer_num=6)
+    # 空格 vocab_tgt[' ']=4877, 看来空格与<blank>不一样
+    pad_idx = vocab_tgt["<blank>"] # 用blank进行padding吗？ pad_idx=2,不知为何要用<blank>作为padding
+
+    #model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt), layer_num=layer_num, d_ff = d_ff, head_num=head_num)
+    model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
+                       layer_num=config['layer_num'],
+                       d_model=config['d_model'],
+                       d_ff=config['d_ff'],
+                       head_num=config['head_num'])
     model.cuda(gpu_id)
 
     module = model
     is_main_process = True
     if is_distributed:
-        dist.init_process_group(
-            "nccl", init_method="env://", rank=gpu_id, world_size=ngpus_per_node
-        )
+        dist.init_process_group("nccl", init_method="env://", rank=gpu_id, world_size=ngpus_per_node)
         model = DDP(model, device_ids=[gpu_id])
         module = model.module
         is_main_process = gpu_id == 0
 
     criterion = LabelSmoothing(vocab_size=len(vocab_tgt), padding_idx=pad_idx, smoothing=0.1)
-    criterion.cuda(gpu_id)
+    criterion.cuda(gpu_id) # Moves all model parameters and buffers to the GPU
 
+    # dataloader:返回src_ids, tgt_ids, padding_ids
     train_dataloader, valid_dataloader = create_dataloaders(
         gpu_id,
         vocab_src,
@@ -1095,10 +1107,8 @@ def train_worker(
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config["base_lr"], betas=(0.9, 0.98), eps=1e-9)
-    lr_scheduler = LambdaLR(
-        optimizer=optimizer,
-        lr_lambda=lambda step: rate(step, d_model, factor=1, warmup=config["warmup"]),
-    )
+    lr_scheduler = LambdaLR(optimizer=optimizer,
+                            lr_lambda=lambda step: rate(step, model_size=config['d_model'], factor=1, warmup=config["warmup"]))
     train_state = TrainState()
 
     for epoch in range(config["num_epochs"]):
@@ -1123,38 +1133,39 @@ def train_worker(
         if is_main_process:
             file_path = "%s%.2d.pt" % (config["file_prefix"], epoch)
             torch.save(module.state_dict(), file_path) #保存模型
+            print("save model to path:{} in each iter".format(file_path))
 
         torch.cuda.empty_cache() # Releases all unoccupied cached memory currently held by the caching
 
         print(f"[GPU{gpu_id}] Epoch {epoch} Validation ====", flush=True)
         model.eval()
         sloss, _ = run_epoch(
-            (Batch(b[0], b[1], pad_idx) for b in valid_dataloader),
+            (Batch(src=b[0], tgt=b[1], pad=pad_idx) for b in valid_dataloader), # 只取第一个样本进行eval
             model,
             SimpleLossCompute(module.generator, criterion),
             DummyOptimizer(),
             DummyScheduler(),
             mode="eval",
         )
-        print(sloss)
+        print("eval loss:", sloss)
         torch.cuda.empty_cache()
 
     if is_main_process:
         file_path = "%sfinal.pt" % config["file_prefix"]
         torch.save(module.state_dict(), file_path)
+        print("save final model to path:{}".format(file_path))
 
-def train_distributed_model(vocab_src, vocab_tgt, spacy_de:Language, spacy_en:Language, config:dict):
+def train_distributed_model(vocab_src:Vocab, vocab_tgt:Vocab, spacy_de:Language, spacy_en:Language, config:dict):
     ngpus = torch.cuda.device_count()
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12356"
     print(f"Number of GPUs detected: {ngpus}")
     print("Spawning training processes ...")
-    mp.spawn(
+    mp.spawn( # 开启多个线程同时训练
         fn=train_worker,
         nprocs=ngpus,
         args=(ngpus, vocab_src, vocab_tgt, spacy_de, spacy_en, config, True),
     )
-
 
 def train_model(vocab_src:Vocab, vocab_tgt:Vocab, spacy_de:Language, spacy_en:Language, config:dict):
     if config["distributed"]:
@@ -1162,182 +1173,3 @@ def train_model(vocab_src:Vocab, vocab_tgt:Vocab, spacy_de:Language, spacy_en:La
     else:
         train_worker(0, 1, vocab_src, vocab_tgt, spacy_de, spacy_en, config, False)
 
-
-def load_or_train_model():
-    print("begin to load or train model")
-    spacy_de, spacy_en = load_tokenizers()
-    vocab_src, vocab_tgt = load_vocab(spacy_de, spacy_en)
-
-    config = {
-        #"batch_size": 32, # 内存超限
-        "batch_size": 2,
-        "distributed": False,
-        "num_epochs": 8,
-        "accum_iter": 10,
-        "base_lr": 1.0,
-        "max_padding": 72,
-        "warmup": 3000,
-        "file_prefix": "multi30k_model_",
-    }
-    model_path = "multi30k_model_final.pt"
-    if not exists(model_path):
-        print(f"not exists train model:{model_path}, begin to train")
-        train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config)
-
-    model = make_model(len(vocab_src), len(vocab_tgt), layer_num=6)
-    model.load_state_dict(torch.load(model_path))
-    return model
-
-"""
-Shared Embeddings
-When using BPE with shared vocabulary we can share the same
-weight vectors between the source / target / generator. See the (cite) (cite) (cite) (cite) for details. To
-add this to the model simply do this:
-"""
-# if False:
-#     model.src_embed[0].lut.weight = model.tgt_embeddings[0].lut.weight # lut:lookup_table
-#     model.generator.lut.weight = model.tgt_embed[0].lut.weight
-
-"""
-The paper averages the last k checkpoints to create an ensembling
-effect. We can do this after the fact if we have a bunch of models
-"""
-def average(model, models):
-    "Average models into model"
-    for ps in zip(*[m.params() for m in [model] + models]):
-        ps[0].copy_(src=torch.sum(*ps[1:]) / len(ps[1:]))
-
-# Load data and model for output checks
-def check_outputs(
-    valid_dataloader,
-    model,
-    vocab_src,
-    vocab_tgt,
-    n_examples=15,
-    pad_idx=2,
-    eos_string="</s>",
-):
-    results = [()] * n_examples
-    for idx in range(n_examples):
-        print("\nExample %d ========\n" % idx)
-        b = next(iter(valid_dataloader))
-        rb = Batch(b[0], b[1], pad_idx)
-        ys = greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0]
-
-        src_tokens = [
-            vocab_src.get_itos()[x] for x in rb.src[0] if x != pad_idx
-        ]
-        tgt_tokens = [
-            vocab_tgt.get_itos()[x] for x in rb.tgt[0] if x != pad_idx
-        ]
-
-        print(
-            "Source Text (Input)        : "
-            + " ".join(src_tokens).replace("\n", "")
-        )
-        print(
-            "Target Text (Ground Truth) : "
-            + " ".join(tgt_tokens).replace("\n", "")
-        )
-        model_out = greedy_decode(model, rb.src, rb.src_mask, 72, 0)[0]
-        model_txt = (
-            " ".join(
-                [vocab_tgt.get_itos()[x] for x in model_out if x != pad_idx]
-            ).split(eos_string, 1)[0]
-            + eos_string
-        )
-        print("Model Output               : " + model_txt.replace("\n", ""))
-        results[idx] = (rb, src_tokens, tgt_tokens, model_out, model_txt)
-    return results
-
-
-# execute_example(run_model_example)
-# ## Attention Visualization
-#
-# > Even with a greedy decoders the translation looks pretty good. We
-# > can further visualize it to see what is happening at each layer of
-# > the attention
-
-# %%
-def matrix_to_dataframe(m:Tensor, max_row:int, max_col:int, row_tokens:dict, col_tokens:dict):
-    "convert a dense matrix to a data frame with row and column indices"
-    return pd.DataFrame(
-        [
-            (
-                r,
-                c,
-                float(m[r, c]),
-                "%.3d %s"
-                % (r, row_tokens[r] if len(row_tokens) > r else "<blank>"),
-                "%.3d %s"
-                % (c, col_tokens[c] if len(col_tokens) > c else "<blank>"),
-            )
-            for r in range(m.shape[0])
-            for c in range(m.shape[1])
-            if r < max_row and c < max_col
-        ],
-        # if float(m[r,c]) != 0 and r < max_row and c < max_col],
-        columns=["row", "column", "value", "row_token", "col_token"],
-    )
-
-
-def attn_map(attn:Tensor, layer, head:int, row_tokens:dict, col_tokens:dict, max_dim=30):
-    df = matrix_to_dataframe(
-        attn[0, head].data,
-        max_dim,
-        max_dim,
-        row_tokens,
-        col_tokens,
-    )
-    return (
-        alt.Chart(data=df)
-        .mark_rect()
-        .encode(
-            x=alt.X("col_token", axis=alt.Axis(title="")),
-            y=alt.Y("row_token", axis=alt.Axis(title="")),
-            color="value",
-            tooltip=["row", "column", "value", "row_token", "col_token"],
-        )
-        .properties(height=400, width=400)
-        .interactive()
-    )
-
-
-def get_encoder(model, layer):
-    return model.encoder.layers[layer].self_attn.attn
-
-
-def get_decoder_self(model, layer):
-    return model.decoder.layers[layer].self_attn.attn
-
-
-def get_decoder_src(model, layer):
-    return model.decoder.layers[layer].src_attn.attn
-
-def visualize_layer(model, layer, getter_fn, ntokens, row_tokens, col_tokens):
-    # ntokens = last_example[0].ntokens
-    attn = getter_fn(model, layer)
-    n_heads = attn.shape[1]
-    charts = [
-        attn_map(
-            attn,
-            0,
-            h,
-            row_tokens=row_tokens,
-            col_tokens=col_tokens,
-            max_dim=ntokens,
-        )
-        for h in range(n_heads)
-    ]
-    assert n_heads == 8
-    return alt.vconcat(
-        charts[0]
-        # | charts[1]
-        | charts[2]
-        # | charts[3]
-        | charts[4]
-        # | charts[5]
-        | charts[6]
-        # | charts[7]
-        # layer + 1 due to 0-indexing
-    ).properties(title="Layer %d" % (layer + 1))
