@@ -1,5 +1,5 @@
 import os
-from typing import Optional,Union,Any,List,Tuple
+from typing import Optional,Union,Any,List,Tuple,Callable
 from os.path import exists
 import numpy as np
 import torch
@@ -375,7 +375,6 @@ def run_model_example(n_examples=5)->Tuple[EncoderDecoder, List[Tuple[str]]]:
     return model, example_data
 
 
-# %% tags=[]
 def viz_encoder_self():
     """
     # example_data: List[(batch_ids, src_tokens, tgt_tokens, model_out, model_txt)]
@@ -385,7 +384,12 @@ def viz_encoder_self():
 
     layer_viz = [
         visualize_layer(
-            model, layer, get_encoder, len(example[1]), example[1], example[1]
+            model=model,
+            layer=layer,
+            get_attn_map_fn=get_encoder,
+            ntokens=len(example[1]),
+            row_tokens=example[1], # self-attention中，token都来源于src_tokens
+            col_tokens=example[1]
         )
         for layer in range(6)
     ]
@@ -399,8 +403,10 @@ def viz_encoder_self():
     )
 
 
-# %% tags=[]
 def viz_decoder_self():
+    """
+    # example_data: List[(batch_ids, src_tokens, tgt_tokens, model_out, model_txt)]
+    """
     model, example_data = run_model_example(n_examples=1)
     example = example_data[len(example_data) - 1]
 
@@ -410,8 +416,8 @@ def viz_decoder_self():
             layer,
             get_decoder_self,
             len(example[1]),
-            example[1],
-            example[1],
+            row_tokens=example[1], # decoder-self-attention中，token都来源于src_tokens
+            col_tokens=example[1],
         )
         for layer in range(6)
     ]
@@ -424,7 +430,10 @@ def viz_decoder_self():
         & layer_viz[5]
     )
 
-def viz_decoder_src():
+def viz_decoder_src(): # decoder-encoder-cross-attention
+    """
+    # example_data: List[(batch_ids, src_tokens, tgt_tokens, model_out, model_txt)]
+    """
     model, example_data = run_model_example(n_examples=1)
     example = example_data[len(example_data) - 1]
 
@@ -434,8 +443,8 @@ def viz_decoder_src():
             layer,
             get_decoder_src,
             max(len(example[1]), len(example[2])),
-            example[1],
-            example[2],
+            row_tokens=example[1],# decoder-cross-attention中，row_tokens来源于src_tokens
+            col_tokens=example[2], # decoder-cross-attention中，col_tokens来源于tgt_tokens
         )
         for layer in range(6)
     ]
@@ -468,12 +477,12 @@ def get_model_config():
     # head_num = 8
     # layer_num = 6
     config = {
-        "batch_size": 100,
-        "num_epochs": 1,
-        "d_model":10,
-        "d_ff":20,
-        "head_num":2,
-        "layer_num":1,
+        "batch_size": 4,
+        "num_epochs": 8,
+        "d_model":512,
+        "d_ff":2048,
+        "head_num":8,
+        "layer_num":6,
         "distributed": False,
         "accum_iter": 10,
         "base_lr": 1.0,
@@ -490,8 +499,7 @@ def load_or_train_model():
 
     config = get_model_config()
     model_path = "multi30k_model_final.pt"
-    #if not exists(model_path):
-    if True:
+    if not exists(model_path):
         print(f"not exists train model:{model_path}, begin to train")
         train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config)
     else:
@@ -499,7 +507,7 @@ def load_or_train_model():
 
     model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
                        layer_num=config['layer_num'], d_model=config['d_model'], d_ff=config['d_ff'], head_num=config['head_num'])
-
+    # 为model加载参数
     model.load_state_dict(torch.load(model_path))
     return model
 
@@ -540,7 +548,7 @@ def check_outputs(
         rb = Batch(src=b[0], tgt=b[1], pad=pad_idx)
         ys = greedy_decode(model, rb.src, rb.src_mask, max_len=64, start_symbol=0)[0]
 
-        src_tokens = [vocab_src.get_itos()[x] for x in rb.src[0] if x != pad_idx ]
+        src_tokens = [vocab_src.get_itos()[x] for x in rb.src[0] if x != pad_idx ] # int -> str
         tgt_tokens = [vocab_tgt.get_itos()[x] for x in rb.tgt[0] if x != pad_idx ]
 
         print( "Source Text (Input)        : " + " ".join(src_tokens).replace("\n", "") )
@@ -566,8 +574,7 @@ def check_outputs(
 # > can further visualize it to see what is happening at each layer of
 # > the attention
 
-# %%
-def matrix_to_dataframe(m:Tensor, max_row:int, max_col:int, row_tokens:dict, col_tokens:dict):
+def matrix_to_dataframe(m:Tensor, max_row:int, max_col:int, row_tokens:List[str], col_tokens:List[str]):
     "convert a dense matrix to a data frame with row and column indices"
     return pd.DataFrame(
         [
@@ -589,9 +596,11 @@ def matrix_to_dataframe(m:Tensor, max_row:int, max_col:int, row_tokens:dict, col
     )
 
 
-def attn_map(attn:Tensor, layer, head:int, row_tokens:dict, col_tokens:dict, max_dim=30):
+# attn: [batch, head, seq_len, seq_len]
+def attn_map(attn:Tensor, head:int, row_tokens:List[str], col_tokens:List[str], max_dim=30):
+    batch = 0
     df = matrix_to_dataframe(
-        attn[0, head].data,
+        attn[batch, head].data,
         max_dim,
         max_dim,
         row_tokens,
@@ -601,40 +610,43 @@ def attn_map(attn:Tensor, layer, head:int, row_tokens:dict, col_tokens:dict, max
         alt.Chart(data=df)
             .mark_rect()
             .encode(
-            x=alt.X("col_token", axis=alt.Axis(title="")),
-            y=alt.Y("row_token", axis=alt.Axis(title="")),
-            color="value",
-            tooltip=["row", "column", "value", "row_token", "col_token"],
-        )
+                x=alt.X("col_token", axis=alt.Axis(title="")),
+                y=alt.Y("row_token", axis=alt.Axis(title="")),
+                color="value",
+                tooltip=["row", "column", "value", "row_token", "col_token"],
+            )
             .properties(height=400, width=400)
             .interactive()
     )
     chart.save("images/attn_map.html")
     return chart
 
-
-def get_encoder(model:EncoderDecoder, layer:int):
+# attn: [batch, head, seq_len, seq_len]
+def get_encoder(model:EncoderDecoder, layer:int)->Tensor:
     return model.encoders.layers[layer].self_attn.attn
 
 
-def get_decoder_self(model:EncoderDecoder, layer:int):
+# attn: [batch, head, seq_len, seq_len]
+def get_decoder_self(model:EncoderDecoder, layer:int)->Tensor:
     return model.decoders.layers[layer].self_attn.attn
 
+# attn: [batch, head, seq_len, seq_len]
+def get_decoder_src(model:EncoderDecoder, layer:int)->Tensor:
+    return model.decoders.layers[layer].src_attn.attn # cross-attention
 
-def get_decoder_src(model:EncoderDecoder, layer:int):
-    return model.decoders.layers[layer].src_attn.attn
-
-def visualize_layer(model:EncoderDecoder, layer:int, get_attn_map_fn:callable,
+def visualize_layer(model:EncoderDecoder,
+                    layer:int,
+                    get_attn_map_fn:Callable[[EncoderLayer, int], Tensor],
                     ntokens:int,
-                    row_tokens,
-                    col_tokens):
+                    row_tokens:List[str],
+                    col_tokens:List[str]):
     # ntokens = last_example[0].ntokens
+    # attn: [batch, head, seq_len, seq_len]
     attn = get_attn_map_fn(model, layer)
     n_heads = attn.shape[1]
     charts = [
         attn_map(
             attn,
-            0,
             h,
             row_tokens=row_tokens,
             col_tokens=col_tokens,
@@ -656,10 +668,10 @@ def visualize_layer(model:EncoderDecoder, layer:int, get_attn_map_fn:callable,
     ).properties(title="Layer %d" % (layer + 1))
 
 if __name__ == '__main__':
-    viz_encoder_self()
+    load_or_train_model()
 
     if False:
-        load_or_train_model()
+        viz_encoder_self()
         run_model_example()
         run_de_translate_to_en()
         load_tokenizers()

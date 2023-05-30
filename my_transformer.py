@@ -385,8 +385,8 @@ class DecoderLayer(nn.Module):
         self.size = size
         self.self_attn:MultiHeadedAttention = self_attn
         self.src_attn:MultiHeadedAttention = src_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(NormDropoutResidual(size, dropout), 3)
+        self.feed_forward:PositionWiseFeedForward = feed_forward
+        self.sublayer:nn.ModuleList[NormDropoutResidual] = clones(NormDropoutResidual(size, dropout), 3)
 
     # x:[batch, seq_len-1, d_model]
     # encoder_memory:[batch, seq_len, d_model]
@@ -405,6 +405,7 @@ class DecoderLayer(nn.Module):
         5. feed forward 
         6. layer norm + dropout + residual
         """
+        # x:[batch, seq_len-1, d_model]
         # 先self attention
         x = self.sublayer[0](x, lambda x: self.self_attn(query=x, key=x, value=x, mask=tgt_mask))
         # 之后cross attention
