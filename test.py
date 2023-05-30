@@ -346,7 +346,7 @@ def example_simple_copy_model():
     print("greedy_decode:", pred)
     print("acc:", (src==pred).sum()/np.prod(src.shape))
 
-def run_model_example(n_examples=5)->Tuple[EncoderDecoder, List[Tuple[str]]]:
+def run_model_example(n_examples=5)->Tuple[EncoderDecoder, List[Tuple[Batch, List[str], List[str], Tensor, str]]]:
     #global vocab_src, vocab_tgt, spacy_de, spacy_en
     spacy_de, spacy_en = load_tokenizers()
     vocab_src, vocab_tgt = load_vocab(spacy_de, spacy_en)
@@ -539,7 +539,7 @@ def check_outputs(
         n_examples=15,
         pad_idx=2,
         eos_string="</s>",
-):
+)->List[Tuple[Batch, List[str], List[str], Tensor, str]]:
     results = [()] * n_examples
     for idx in range(n_examples):
         print("\nExample %d ========\n" % idx)
