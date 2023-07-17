@@ -24,12 +24,12 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from my_transformer import *
 
 RUN_EXAMPLES = True
 
 # %%
 # Some convenience helper functions used throughout the notebook
-from my_transformer import *
 
 
 def is_interactive_notebook():
@@ -668,14 +668,14 @@ def visualize_layer(model:EncoderDecoder,
     ).properties(title="Layer %d" % (layer + 1))
 
 if __name__ == '__main__':
-    load_or_train_model()
+    #load_or_train_model()
+    example_simple_copy_model()
 
     if False:
         viz_encoder_self()
         run_model_example()
         run_de_translate_to_en()
         load_tokenizers()
-        example_simple_copy_model()
         #execute_example(example_simple_copy_model)
         test_loss()
         example_learning_schedule()

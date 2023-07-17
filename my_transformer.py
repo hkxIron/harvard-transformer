@@ -421,11 +421,12 @@ class Decoders(nn.Module):
         self.layers:nn.ModuleList[DecoderLayer] = clones(layer, N)
         self.norm = LayerNorm(features=layer.size)
 
-    # x:[batch, seq_len-1, d_model]
+    # target_embed:[batch, seq_len-1, d_model]
     # memory:[batch, seq_len, d_model]
     # src_mask:[batch,1,seq_len]
     # tgt_mask:[batch,seq_len-1,seq_len-1]
-    def forward(self, x:Tensor, memory:Tensor, src_mask:Tensor, tgt_mask:Tensor):
+    def forward(self, target_embed:Tensor, memory:Tensor, src_mask:Tensor, tgt_mask:Tensor):
+        x = target_embed
         for layer in self.layers:
             x = layer(x, memory, src_mask, tgt_mask)
         return self.norm(x)
@@ -469,7 +470,7 @@ class EncoderDecoder(nn.Module):
         return out
 
     # src_ids:[batch, seq_len]
-    # src_mask:[batch, 1, seq_len]
+    # src_mask:[batch, 1, seq_len], 这个mask不是cause-future mask，而只是batch中每个样本长度的说明
     # out:[batch, seq_len, d_model]
     def encode(self, src_ids:Tensor, src_mask:Tensor):
         # embed:[batch, seq_len, d_model]
@@ -484,11 +485,18 @@ class EncoderDecoder(nn.Module):
     # tgt_mask:[batch, seq_len-1, seq_len-1]
     def decode(self, encoder_memory:Tensor, src_mask:Tensor, tgt_ids:Tensor, tgt_mask:Tensor):
         # embed:[batch, seq_len-1, d_model]
-        embed = self.tgt_embed(tgt_ids)
+        target_embed = self.tgt_embed(tgt_ids)
         # out:[batch, seq_len-1, d_model]
-        out = self.decoders(embed, encoder_memory, src_mask, tgt_mask)
+        out = self.decoders(target_embed, encoder_memory, src_mask, tgt_mask)
         return out
 
+"""
+subsequent_mask(3): 
+=> # 可见性是下三角矩阵, 即CasualLM
+tensor([[[ True, False, False],
+         [ True,  True, False],
+         [ True,  True,  True]]])
+"""
 def subsequent_mask(size:int)->Tensor:
     "Mask out subsequent positions."
     """
