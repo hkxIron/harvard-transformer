@@ -516,6 +516,8 @@ def subsequent_mask(size:int)->Tensor:
     return subsequent_mask == 0 # 只取下三角矩阵
 
 """
+d_k= dmodel/head_num
+
 query, key, value => [batch, head_num, seq_len, d_k]
 mask:
   encoder时mask:[batch, head=1, 1, seq_len]，
@@ -668,6 +670,34 @@ class LabelSmoothing(nn.Module):
         out = self.kldiv_loss.forward(input=pred_scores, target=smoothed_target_dist.clone().detach())
         return out
 
+""""
+推理时优化trick：
+
+background:
+在CasualLM中，模型在inference时需要完成如下步骤：
+1. 将context对应的Input ids映射为对应的Embeddings
+2. 经过N层transformer，计算对应的logits
+3. 取logits的最后一位，按指定的采样方法选择出当前预测的token
+4. 判断是否可以停止推理
+  1. 若该token是停止符，或此时已达到最大长度，则停止推理
+  2. 否则，将该token concat至context后，并重复step1~step3
+  
+显然context部分会重复执行1~3步的计算，因此在现行大多数推理框架中都会引入kv缓存技术：
+
+在上述步骤2中，在获得logits的同时记录此时每一层Transformer中对应的Attention Key与Value
+在步骤3得到next token后，无需将next token与context拼接，仅使用该token执行1~3步
+在计算attention时，以该token的embedding为query，与之前缓存的Key与Value计算新的attention
+
+历史交互缓存trick
+target：使得multi-round session中延迟不随会话轮数而增加
+模型推理过程中，会将forward中产生的attention Key与Value缓存下来用于后续推理，在默认框架中，该缓存仅发生于单条样本内部。
+
+而在multi-round场景中，希望将其推广到session中的多条样本中：
+1. 当收到用户的第一次请求后，模型在给出回复结果的同时输出对应的Key/Value
+2. 将Key/Value以session id为key进行缓存
+3. 当用户再次请求时，无需将其历史会话拼接至prompt中，仅需要将对应Key/Value从缓存中取出，并进行inference
+"""
+
 # > This code predicts a translation using greedy decoding for simplicity.
 # src:[batch=1, seq_len]
 # src_mask:[batch=1, 1,seq_len]
@@ -682,13 +712,14 @@ def greedy_decode(model:EncoderDecoder, src:Tensor, src_mask:Tensor, max_len:int
         tgt_mask = subsequent_mask(cur_seq_len).type_as(src.data)
         # src_mask:[batch=1, 1,seq_len]
         # ys:[batch=1, seq_len=1]
+        # tgt_mask:[batch=1, seq_len-1, seq_len-1]
         # out:[batch, cur_seq_len, d_model]
         out = model.decode(memory, src_mask, ys, tgt_mask)
         # last_out: [d_model], 取最后一列进行预测
         last_out = out[:, -1]
         # prob:[batch=1, vocab_size]
         prob = model.generator(last_out)
-        _, next_word = torch.max(prob, dim=1)
+        _, next_word = torch.max(prob, dim=1) # 贪心算法，直接用最大值
         next_word = next_word.data[0]
         # ys:[batch=1,cur_seq_len+1]
         ys = torch.cat(
