@@ -694,8 +694,8 @@ target：使得multi-round session中延迟不随会话轮数而增加
 
 而在multi-round场景中，希望将其推广到session中的多条样本中：
 1. 当收到用户的第一次请求后，模型在给出回复结果的同时输出对应的Key/Value
-2. 将Key/Value以session id为key进行缓存
-3. 当用户再次请求时，无需将其历史会话拼接至prompt中，仅需要将对应Key/Value从缓存中取出，并进行inference
+2. 将Key/Value以session id为key进行cache缓存
+3. 当用户再次请求时，无需将其历史会话接至prompt中，仅需要将对应Key/Value从缓存中取出，并进行inference,可以大大减小推理时间
 """
 
 # > This code predicts a translation using greedy decoding for simplicity.
