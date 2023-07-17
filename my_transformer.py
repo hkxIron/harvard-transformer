@@ -197,7 +197,7 @@ class MultiHeadedAttention(nn.Module):
 
     # query:[batch, seq_len, d_model]
     # key:[batch, seq_len, d_model]
-    # vlaue:[batch, seq_len, d_model]
+    # value:[batch, seq_len, d_model]
     # mask:
     #   encoder时mask:[batch, 1, seq_len]，
     #   decoder时mask:[batch, seq_len-1, seq_len-1]
@@ -228,11 +228,11 @@ class MultiHeadedAttention(nn.Module):
 
         # 2) Apply attention on all the projected vectors in batch.
 
-        # query, key, value:[batch, head_num, seq_len, d_k]
+        # query, key, value:[batch, head_num, seq_len, d_k=dmodel/head_num]
         # mask:
-        #   encoder时mask:[batch, 1, 1, seq_len]，
-        #   decoder时mask:[batch, 1, seq_len-1, seq_len-1]
-        # x: [batch, head_num, seq_len, d_k]
+        #   encoder时mask:[batch, 1, 1, seq_len]，encoder时的mask只是对batch中每个样本的序列长度的mask
+        #   decoder时mask:[batch, 1, seq_len-1, seq_len-1], decoder时的mask是encoder-decoder的因果mask
+        # x: [batch, head_num, seq_len, d_k], 其中d_k = dmodel/head_num
         # attn: [batch, head_num, seq_len, d_k]
         x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
 
