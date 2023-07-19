@@ -546,7 +546,7 @@ def attention(query:Tensor, key:Tensor, value:Tensor, mask:Tensor=None, dropout:
     if dropout is not None:
         p_attn = dropout(p_attn)
     # p_attn:[batch, head_num, seq_len, seq_len]
-    # value:[batch, head_num, seq_len, seq_len]
+    # value:[batch, head_num, seq_len, d_k]
     # attn_value:[batch, head_num, seq_len, d_k]
     attn_value = torch.matmul(p_attn, value)
     return attn_value, p_attn
