@@ -21,7 +21,7 @@ data_base_path = r"./imdb_test/aclImdb"
 # 这个里面是存储你训练出来的模型的，现在是空的
 model_path = r"./imdb_test/aclImdb/mode"
 
-
+# https://zhuanlan.zhihu.com/p/535100411
 # 1. 准备dataset，这里写了一个数据读取的类，并把数据按照不同的需要进行了分类；
 class ImdbDataset(Dataset):
     def __init__(self, mode, testNumber=10000, validNumber=5000):
