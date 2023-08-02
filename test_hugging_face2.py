@@ -16,10 +16,10 @@ from tqdm import tqdm
 
 # 路径需要根据情况修改，要看你把数据下载到哪里了
 # 数据下载地址在斯坦福官网，网上搜索就有
-data_base_path = r"./imdb_test/aclImdb"
+data_base_path = r"data/imdb/"
 
 # 这个里面是存储你训练出来的模型的，现在是空的
-model_path = r"./imdb_test/aclImdb/mode"
+model_path = r"data/imdb/model"
 
 # https://zhuanlan.zhihu.com/p/535100411
 # 1. 准备dataset，这里写了一个数据读取的类，并把数据按照不同的需要进行了分类；
@@ -107,7 +107,7 @@ class BertClassificationModel(nn.Module):
 
         for p in self.bert.parameters():  # 冻结bert参数
             p.requires_grad = False
-        self.fc = nn.Linear(hidden_size, in_features=2)
+        self.fc = nn.Linear(hidden_size, 2)
 
     def forward(self, batch_sentences):  # [batch_size,1]
         sentences_tokenizer = self.tokenizer(batch_sentences,
