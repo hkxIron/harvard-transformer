@@ -14,8 +14,10 @@ import torch.optim as optim
 from transformers import BertModel, BertTokenizer
 from tqdm import tqdm
 
+
 # 路径需要根据情况修改，要看你把数据下载到哪里了
 # 数据下载地址在斯坦福官网，网上搜索就有
+# 在我的百度网盘上也有的
 data_base_path = r"data/imdb/"
 
 # 这个里面是存储你训练出来的模型的，现在是空的
@@ -53,7 +55,7 @@ class ImdbDataset(Dataset):
                 self.total_file_path_list.extend([os.path.join(i, j) for j in os.listdir(i)])
             self.total_file_path_list = sample(self.total_file_path_list, validNumber)
 
-    def tokenize(self, text):
+    def pre_process(self, text:str):
 
         # 具体要过滤掉哪些字符要看你的文本质量如何
 
@@ -66,13 +68,13 @@ class ImdbDataset(Dataset):
         text = re.sub("|".join(fileters), " ", text, flags=re.S)  # 替换掉特殊字符，'|'是把所有要匹配的特殊字符连在一起
         return text  # 返回文本
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx:int):
         cur_path = self.total_file_path_list[idx]
         # 返回path最后的文件名。如果path以／或\结尾，那么就会返回空值。即os.path.split(path)的第二个元素。
         # cur_filename返回的是如：“0_3.txt”的文件名
         cur_filename = os.path.basename(cur_path)
         # 标题的形式是：3_4.txt	前面的3是索引，后面的4是分类
-        # 如果是小于等于5分的，是负面评论，labei给值维1，否则就是1
+        # 如果是小于等于5分的，是负面评论，label给值维1，否则就是1
         labels = []
         sentences = []
         if int(cur_filename.split("_")[-1].split(".")[0]) <= 5:
@@ -81,7 +83,8 @@ class ImdbDataset(Dataset):
             label = 1
         # temp.append([label])
         labels.append(label)
-        text = self.tokenize(open(cur_path, encoding='UTF-8').read().strip())  # 处理文本中的奇怪符号
+        # read()是读取所有文本
+        text = self.pre_process(open(cur_path, encoding='UTF-8').read().strip())  # 处理文本中的奇怪符号
         sentences.append(text)
         # 可见我们这里返回了一个list，这个list的第一个值是标签0或者1，第二个值是这句话；
         return sentences, labels
@@ -128,20 +131,17 @@ class BertClassificationModel(nn.Module):
 # 3. 程序入口，模型也搞完啦，我们可以开始训练，并验证模型的可用性
 
 def main():
-    testNumber = 10000  # 多少个数据参与训练模型
+    testNumber = 1000  # 多少个数据参与训练模型
     validNumber = 100  # 多少个数据参与验证
-    batchsize = 250  # 定义每次放多少个数据参加训练
+    batchsize = 5  # 定义每次放多少个数据参加训练
 
     trainDatas = ImdbDataset(mode="test", testNumber=testNumber)  # 加载训练集,全量加载，考虑到我的破机器，先加载个100试试吧
     validDatas = ImdbDataset(mode="valid", validNumber=validNumber)  # 加载训练集
 
-    train_loader = torch.utils.data.DataLoader(trainDatas, batch_size=batchsize,
-                                               shuffle=False)  # 遍历train_dataloader 每次返回batch_size条数据
-
+    train_loader = torch.utils.data.DataLoader(trainDatas, batch_size=batchsize, shuffle=False)  # 遍历train_dataloader 每次返回batch_size条数据
     val_loader = torch.utils.data.DataLoader(validDatas, batch_size=batchsize, shuffle=False)
 
     # 这里搭建训练循环，输出训练结果
-
     epoch_num = 1  # 设置循环多少次训练，可根据模型计算情况做调整，如果模型陷入了局部最优，那么循环多少次也没啥用
 
     print('training...(约1 hour(CPU))')
@@ -185,7 +185,7 @@ def main():
         # print(labels[0])
         num += (out == labels[0]).sum().item()
         # total += len(labels)
-    print('Accuracy:', num / validNumber)
+    print('accuracy:', num / validNumber)
 
 
 if __name__ == '__main__':
