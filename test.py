@@ -667,11 +667,22 @@ def visualize_layer(model:EncoderDecoder,
         # layer + 1 due to 0-indexing
     ).properties(title="Layer %d" % (layer + 1))
 
+def test_norm():
+    x = np.random.randn(2, 3)
+    print(x.shape)
+    t = x.ravel()
+    print(t.shape)
+    print(t)
+    print(np.linalg.norm(t)) #F-范式，即为2范式
+    print(np.sqrt((t*t).sum())) # 与上面的2范式结果相同
+
 if __name__ == '__main__':
     #load_or_train_model()
     example_simple_copy_model()
+    test_norm()
 
     if False:
+        load_or_train_model()
         viz_encoder_self()
         run_model_example()
         run_de_translate_to_en()

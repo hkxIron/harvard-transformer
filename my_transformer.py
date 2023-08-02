@@ -100,7 +100,7 @@ class PositionWiseFeedForward(nn.Module):
     # out:[batch,seq_len, d_model]
     def forward(self, x:Tensor):
         # 注意：第二层后面没有激活函数
-        return self.w_2(self.dropout(self.w_1(x).relu()))
+        return self.w_2(self.dropout(self.w_1(x).relu())) # position_feedforward中非线性激活用的都是relu
 
 
 class VocabEmbedding(nn.Module):
