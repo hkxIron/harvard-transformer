@@ -127,10 +127,10 @@ class BertClassificationModel(nn.Module):
         #attention_mask:[batch, max_seq_len_in_batch], 有值的地方为1,padding的地方为0
         attention_mask = torch.tensor(sentences_tokenizer['attention_mask'])  # 变量
         bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)  # 模型
-
         last_hidden_state = bert_out[0]  # [batch_size, sequence_length, hidden_size], bert_out[0]:last_hidden_state, bert_out[1]:pooler_output
+        pooler = bert_out.pooler_output # pooler其实就是last_hidden_state中的cls过了一层mlp+激活函数后的结果
         # [batch, hidden_size]
-        bert_cls_hidden_state = last_hidden_state[:, 0, :]  # 变量
+        bert_cls_hidden_state = last_hidden_state[:, 0, :]  # cls变量
         # 最后一层加上全连接
         # [batch, 2]
         fc_out = self.fc(bert_cls_hidden_state)  # 模型
