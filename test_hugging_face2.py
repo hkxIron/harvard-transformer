@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from transformers import BertModel, BertTokenizer
 from tqdm import tqdm
+from typing import *
 
 
 # 路径需要根据情况修改，要看你把数据下载到哪里了
@@ -68,15 +69,17 @@ class ImdbDataset(Dataset):
         text = re.sub("|".join(fileters), " ", text, flags=re.S)  # 替换掉特殊字符，'|'是把所有要匹配的特殊字符连在一起
         return text  # 返回文本
 
+    # Dataset会保证idx<__len__()的值
     def __getitem__(self, idx:int):
+        # 这个数据集里，每个文件只有一个评论
         cur_path = self.total_file_path_list[idx]
         # 返回path最后的文件名。如果path以／或\结尾，那么就会返回空值。即os.path.split(path)的第二个元素。
         # cur_filename返回的是如：“0_3.txt”的文件名
         cur_filename = os.path.basename(cur_path)
         # 标题的形式是：3_4.txt	前面的3是索引，后面的4是分类
-        # 如果是小于等于5分的，是负面评论，label给值维1，否则就是1
-        labels = []
-        sentences = []
+        # 如果是小于等于5分的，是负面评论，label给值为0，否则就是1
+        labels:List[int] = []
+        sentences:List[str] = []
         if int(cur_filename.split("_")[-1].split(".")[0]) <= 5:
             label = 0
         else:
@@ -95,7 +98,6 @@ class ImdbDataset(Dataset):
 
 # 2. 这里开始利用huggingface搭建网络模型
 # 这个类继承再nn.module,后续再详细介绍这个模块
-#
 class BertClassificationModel(nn.Module):
     def __init__(self, hidden_size=768):
         super(BertClassificationModel, self).__init__()
@@ -109,8 +111,10 @@ class BertClassificationModel(nn.Module):
         self.bert = BertModel.from_pretrained(pretrained_model_name_or_path=model_name)
 
         for p in self.bert.parameters():  # 冻结bert参数
-            p.requires_grad = False
-        self.fc = nn.Linear(hidden_size, 2)
+            p.requires_grad = False # bert不参与训练
+        print(f"param num:{self.bert.num_parameters()}") # 参数量：1亿, 109482240
+        # 后面加一层全边接
+        self.fc = nn.Linear(in_features=hidden_size, out_features=2)
 
     def forward(self, batch_sentences):  # [batch_size,1]
         sentences_tokenizer = self.tokenizer(batch_sentences,
@@ -118,12 +122,17 @@ class BertClassificationModel(nn.Module):
                                              padding=True,
                                              max_length=512,
                                              add_special_tokens=True)
+        #input_ids:[batch, max_seq_len_in_batch]
         input_ids = torch.tensor(sentences_tokenizer['input_ids'])  # 变量
+        #attention_mask:[batch, max_seq_len_in_batch], 有值的地方为1,padding的地方为0
         attention_mask = torch.tensor(sentences_tokenizer['attention_mask'])  # 变量
         bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)  # 模型
 
-        last_hidden_state = bert_out[0]  # [batch_size, sequence_length, hidden_size] # 变量
+        last_hidden_state = bert_out[0]  # [batch_size, sequence_length, hidden_size], bert_out[0]:last_hidden_state, bert_out[1]:pooler_output
+        # [batch, hidden_size]
         bert_cls_hidden_state = last_hidden_state[:, 0, :]  # 变量
+        # 最后一层加上全连接
+        # [batch, 2]
         fc_out = self.fc(bert_cls_hidden_state)  # 模型
         return fc_out
 
@@ -131,7 +140,7 @@ class BertClassificationModel(nn.Module):
 # 3. 程序入口，模型也搞完啦，我们可以开始训练，并验证模型的可用性
 
 def main():
-    testNumber = 1000  # 多少个数据参与训练模型
+    testNumber = 10000  # 多少个数据参与训练模型
     validNumber = 100  # 多少个数据参与验证
     batchsize = 5  # 定义每次放多少个数据参加训练
 
@@ -153,13 +162,17 @@ def main():
 
     # 这里是定义损失函数，交叉熵损失函数比较常用解决分类问题
     # 依据你解决什么问题，选择什么样的损失函数
-    criterion = nn.CrossEntropyLoss()
-
+    criterion = nn.CrossEntropyLoss() # 也可以用nn.BCELoss()
+    model.train()
     print("模型数据已经加载完成,现在开始模型训练。")
     for epoch in range(epoch_num):
+        # 这里data,labels来源于自定义数据集中__get_item__接口的返回,注意返回的是list
         for i, (data, labels) in enumerate(train_loader, 0):
+            # output:[batch, 2]
             output = model(data[0])
             optimizer.zero_grad()  # 梯度清0
+            # output:[batch, 2]
+            # labels[0]:[batch], 每个元素均为0或1
             loss = criterion(output, labels[0])  # 计算误差
             loss.backward()  # 反向传播
             optimizer.step()  # 更新参数
@@ -178,11 +191,12 @@ def main():
     num = 0
     model.eval()  # 不启用 BatchNormalization 和 Dropout，保证BN和dropout不发生变化,主要是在测试场景下使用；
     for j, (data, labels) in enumerate(val_loader, 0):
+        # output:[batch, 2]
         output = model(data[0])
         # print(output)
+        # output:[batch]
         out = output.argmax(dim=1)
-        # print(out)
-        # print(labels[0])
+        # labels[0]:[batch], 每个元素均为0或1
         num += (out == labels[0]).sum().item()
         # total += len(labels)
     print('accuracy:', num / validNumber)
