@@ -676,9 +676,23 @@ def test_norm():
     print(np.linalg.norm(t)) #F-范式，即为2范式
     print(np.sqrt((t*t).sum())) # 与上面的2范式结果相同
 
+def test_layer_norm():
+    batch=4
+    seq_len=3
+    model_size=2
+    x = torch.Tensor(np.random.randn(batch, seq_len, model_size))
+    norm = LayerNorm(features=model_size)
+    y = norm(x)
+    print(x)
+    print(y)
+    print(x.shape)
+    print(y.shape)
+
+
 if __name__ == '__main__':
+    test_layer_norm()
     #load_or_train_model()
-    example_simple_copy_model()
+    #example_simple_copy_model()
 
     if False:
         test_norm()

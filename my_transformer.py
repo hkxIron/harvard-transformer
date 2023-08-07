@@ -346,9 +346,13 @@ class LayerNorm(nn.Module):
         self.eps = eps
 
     # x:[batch, seq_len, d_model]
-    def forward(self, x:Tensor):
+    def forward(self, x:Tensor)->Tensor:
+        # x:[batch, seq_len, features=model_size]
+        # mean:[batch, seq_len, 1]
         mean = x.mean(dim=-1, keepdim=True) # 即模型的每一个维度上计算均值与方差
+        # mean:[batch, seq_len, 1]
         std = x.std(dim=-1, keepdim=True)
+        # out:[batch, seq_len, features]
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 class NormDropoutResidual(nn.Module):
