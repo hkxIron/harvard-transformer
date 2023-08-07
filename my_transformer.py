@@ -5,6 +5,7 @@
 # * *[Original](https://nlp.seas.harvard.edu/2018/04/03/attention.html):
 #    [Sasha Rush](http://rush-nlp.com/).*
 
+from typing import *
 import os
 from os.path import exists
 import torch
@@ -17,7 +18,8 @@ from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
 from typing import Optional,Union,Any,List,Tuple
-from torch._tensor import Tensor
+#from torch._tensor import Tensor
+from torch import Tensor
 # alt.renderers.enable('notebook')
 # alt.renderers.enable('mimetype')
 
@@ -98,10 +100,10 @@ class PositionWiseFeedForward(nn.Module):
 
     # x:[batch,seq_len, d_model]
     # out:[batch,seq_len, d_model]
-    def forward(self, x:Tensor):
-        # 注意：第二层后面没有激活函数
-        return self.w_2(self.dropout(self.w_1(x).relu())) # position_feedforward中非线性激活用的都是relu
-
+    def forward(self, x:Tensor) -> Tensor:
+        # 注意：第二层后面没有激活函数!!!
+        # 第二层没有激活函数，原因是为了恢复出x, 即对输入的x进行压缩后恢复
+        return self.w_2(self.dropout(self.w_1(x).relu())) # position_feedforward第一层非线性激活用的是relu
 
 class VocabEmbedding(nn.Module):
     def __init__(self, d_model:int, vocab:int):
@@ -203,7 +205,7 @@ class MultiHeadedAttention(nn.Module):
     #   decoder时mask:[batch, seq_len-1, seq_len-1]
     #
     # return: [batch, seq_len, d_model]
-    def forward(self, query:Tensor, key:Tensor, value:Tensor, mask:Tensor=None):
+    def forward(self, query:Tensor, key:Tensor, value:Tensor, mask:Tensor=None) -> Tensor:
         "Implements Figure 2"
         if mask is not None:
             # Same mask applied to all head_num heads.
@@ -276,20 +278,20 @@ class EncoderLayer(nn.Module):
     def forward(self, x:Tensor, mask:Tensor):
         "Follow Figure 1 (left) for connections."
         """
-        1. self attention
-        2. layer norm + residual + dropout
+        1. layer norm (现在是pre_norm,原始paper中是post_norm)
+        2. self attention + dropout + residual
         
-        3. feed forward 
-        4. layer norm + residual + dropout
+        3. layer norm 
+        4. feedforward + dropout + residual
         """
         # x:[batch, seq_len, d_model]
         # attention_out:[batch, seq_len, d_model]
         # mask:
         #   encoder时mask:[batch, 1, seq_len]，
         #   decoder时mask:[batch, seq_len-1, seq_len-1]
-        x = self.residualLayers[0](x, sublayer=lambda x: self.self_attn(query=x, key=x, value=x, mask=mask))
+        x = self.residualLayers[0](x, attention_or_feedforward_layer_fn=lambda x: self.self_attn(query=x, key=x, value=x, mask=mask))
         # x:[batch, seq_len, d_model]
-        x = self.residualLayers[1](x, sublayer=self.feed_forward)
+        x = self.residualLayers[1](x, attention_or_feedforward_layer_fn=self.feed_forward)
         return x
 
 class Generator(nn.Module):
@@ -361,16 +363,20 @@ class NormDropoutResidual(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     # x:[batch, seq_len, d_model]
-    def forward(self, x:Tensor, sublayer:nn.Module):
+    def forward(self, x:Tensor, attention_or_feedforward_layer_fn:Callable[[Tensor], Tensor]) -> Tensor:
         "Apply residual connection to any sublayer with the same size."
         # residual layer在之前会layer_norm,之后会drop_out
         """
-        1. layer norm + sublayer + dropout
-        4. add
+        sublayer一般为:self_attention或者cross_attention
+        
+        1. layer norm (现在是pre_norm,原始paper中是post_norm)
+        2. attention(self_attn or cross_attn or feed_forward)
+        3. dropout
+        4. residual
         """
-        normed = self.norm(x)
-        sub_out = sublayer(normed)
-        dropped = self.dropout(sub_out)
+        layer_normed = self.norm(x)
+        attention_or_feedforward = attention_or_feedforward_layer_fn(layer_normed)
+        dropped = self.dropout(attention_or_feedforward)
         return x + dropped
 
 class DecoderLayer(nn.Module):
@@ -395,21 +401,23 @@ class DecoderLayer(nn.Module):
     # return: [batch, seq_len-1, d_model]
     def forward(self, x:Tensor, encoder_memory:Tensor, src_mask:Tensor, tgt_mask:Tensor):
         "Follow Figure 1 (right) for connections."
+
         """
-        1. self attention
-        2. layer norm + dropout + residual
+        1. layer norm(现在是pre_norm, 原始paper中是post_norm)
+        2. self attention + dropout + residual
+
+        3. layer norm
+        4. src_target cross attention  + dropout + residual
         
-        3. src-target cross attention
-        4. layer norm + dropout + residual
-        
-        5. feed forward 
-        6. layer norm + dropout + residual
+        5. layer norm
+        6. feedforward + dropout + residual
         """
         # x:[batch, seq_len-1, d_model]
         # 先self attention
         x = self.sublayer[0](x, lambda x: self.self_attn(query=x, key=x, value=x, mask=tgt_mask))
         # 之后cross attention
         x = self.sublayer[1](x, lambda x: self.src_attn(query=x, key=encoder_memory, value=encoder_memory, mask=src_mask))
+        # feed_forward
         x = self.sublayer[2](x, self.feed_forward)
         return x
 
@@ -433,7 +441,7 @@ class Decoders(nn.Module):
 
 class EncoderDecoder(nn.Module):
     """
-    A standard Encoder-Decoder architecture. Base for this and many
+    A standard Encoder-Decoder(Transformer) architecture. Base for this and many
     other models.
     """
     def __init__(self, encoder:Encoders,
@@ -452,7 +460,7 @@ class EncoderDecoder(nn.Module):
     # tgt_ids:[batch_size, seq_len-1]
     # src_mask:[batch_size, 1, seq_len]
     # tgt_mask:[batch_size, seq_len-1, seq_len-1]
-    def forward(self, src_ids:Tensor, tgt_ids:Tensor, src_mask:Tensor, tgt_mask:Tensor):
+    def forward(self, src_ids:Tensor, tgt_ids:Tensor, src_mask:Tensor, tgt_mask:Tensor)-> Tensor:
         "Take in and process masked src and target sequences."
         """
         典型的翻译encoder-decoder架构
@@ -472,7 +480,7 @@ class EncoderDecoder(nn.Module):
     # src_ids:[batch, seq_len]
     # src_mask:[batch, 1, seq_len], 这个mask不是cause-future mask，而只是batch中每个样本长度的说明
     # out:[batch, seq_len, d_model]
-    def encode(self, src_ids:Tensor, src_mask:Tensor):
+    def encode(self, src_ids:Tensor, src_mask:Tensor)-> Tensor:
         # embed:[batch, seq_len, d_model]
         embed = self.src_embed(src_ids)
         # out:[batch, seq_len, d_model]
@@ -483,7 +491,7 @@ class EncoderDecoder(nn.Module):
     # src_mask:[batch, 1, seq_len]
     # tgt_ids:[batch, seq_len-1]
     # tgt_mask:[batch, seq_len-1, seq_len-1]
-    def decode(self, encoder_memory:Tensor, src_mask:Tensor, tgt_ids:Tensor, tgt_mask:Tensor):
+    def decode(self, encoder_memory:Tensor, src_mask:Tensor, tgt_ids:Tensor, tgt_mask:Tensor) -> Tensor:
         # embed:[batch, seq_len-1, d_model]
         target_embed = self.tgt_embed(tgt_ids)
         # out:[batch, seq_len-1, d_model]
@@ -527,7 +535,7 @@ mask:
     attn_value: [batch, head, seq_len, d_k]
     p_attn: [batch, head, seq_len, seq_len]
 """
-def attention(query:Tensor, key:Tensor, value:Tensor, mask:Tensor=None, dropout:nn.Dropout=None):
+def attention(query:Tensor, key:Tensor, value:Tensor, mask:Tensor=None, dropout:nn.Dropout=None)->Tuple[Tensor, Tensor]:
     "Compute 'Scaled Dot Product Attention'"
     d_model = query.size(-1)
     # 之所以除以d_model,因为如果key,query方差为1,均值为0, 则query@key之后，其方差为d_model

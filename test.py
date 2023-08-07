@@ -329,7 +329,7 @@ def example_simple_copy_model():
             DummyOptimizer(),
             DummyScheduler(),
             mode="eval",
-        )[0]
+        )
         print("eval loss:", eval_loss)
 
     model.eval() # set test mode, 展示部分例子
@@ -679,9 +679,9 @@ def test_norm():
 if __name__ == '__main__':
     #load_or_train_model()
     example_simple_copy_model()
-    test_norm()
 
     if False:
+        test_norm()
         load_or_train_model()
         viz_encoder_self()
         run_model_example()
