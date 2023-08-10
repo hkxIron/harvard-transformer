@@ -94,8 +94,8 @@ class PositionWiseFeedForward(nn.Module):
     # 注意：d_ff 一般比d_model大很多,如d_ff=2048, d_model=512
     def __init__(self, d_model:int, d_ff:int, dropout=0.1):
         super(PositionWiseFeedForward, self).__init__()
-        self.w_1 = nn.Linear(d_model, d_ff, bias=True)
-        self.w_2 = nn.Linear(d_ff, d_model, bias=True)
+        self.dense1 = nn.Linear(d_model, d_ff, bias=True)
+        self.dense2 = nn.Linear(d_ff, d_model, bias=True)
         self.dropout = nn.Dropout(dropout)
 
     # x:[batch,seq_len, d_model]
@@ -103,7 +103,7 @@ class PositionWiseFeedForward(nn.Module):
     def forward(self, x:Tensor) -> Tensor:
         # 注意：第二层后面没有激活函数!!!
         # 第二层没有激活函数，原因是为了恢复出x, 即对输入的x进行压缩后恢复
-        return self.w_2(self.dropout(self.w_1(x).relu())) # position_feedforward第一层非线性激活用的是relu
+        return self.dense2(self.dropout(self.dense1(x).relu())) # position_feedforward第一层非线性激活用的是relu
 
 class VocabEmbedding(nn.Module):
     def __init__(self, d_model:int, vocab:int):
@@ -278,11 +278,9 @@ class EncoderLayer(nn.Module):
     def forward(self, x:Tensor, mask:Tensor):
         "Follow Figure 1 (left) for connections."
         """
-        1. layer norm (现在是pre_norm,原始paper中是post_norm)
-        2. self attention + dropout + residual
-        
-        3. layer norm 
-        4. feedforward + dropout + residual
+        (现在是pre_norm,原始paper中是post_norm)
+        1. layer norm + self attention + dropout + residual
+        2. layer norm + feedforward + dropout + residual
         """
         # x:[batch, seq_len, d_model]
         # attention_out:[batch, seq_len, d_model]
@@ -407,14 +405,11 @@ class DecoderLayer(nn.Module):
         "Follow Figure 1 (right) for connections."
 
         """
-        1. layer norm(现在是pre_norm, 原始paper中是post_norm)
-        2. self attention + dropout + residual
-
-        3. layer norm
-        4. src_target cross attention  + dropout + residual
-        
-        5. layer norm
-        6. feedforward + dropout + residual
+        现在是pre_norm, 原始paper中是post_norm
+        1. layer norm + self attention + dropout + residual
+        2. layer norm + feedforward + dropout + residual
+        3. layer norm + src_target cross attention  + dropout + residual
+        4. layer norm + feedforward + dropout + residual
         """
         # x:[batch, seq_len-1, d_model]
         # 先self attention
