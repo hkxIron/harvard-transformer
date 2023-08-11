@@ -20,10 +20,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from typing import Dict
 import collections
 import re
 import unicodedata
 import six
+from typing import Union
 #import tensorflow as tf
 
 
@@ -120,7 +122,7 @@ def printable_text(text):
     raise ValueError("Not running on Python2 or Python 3?")
 
 
-def load_vocab(vocab_file):
+def load_vocab(vocab_file:str)->Dict[str, int]:
   """Loads a vocabulary file into a dictionary."""
   vocab = collections.OrderedDict()
   index = 0
@@ -196,7 +198,7 @@ class BasicTokenizer(object):
     """
     self.do_lower_case = do_lower_case
 
-  def tokenize(self, text):
+  def tokenize(self, text:Union[str, bytes]):
     """Tokenizes a piece of text."""
     text = convert_to_unicode(text)
     text = self._clean_text(text)
@@ -209,7 +211,7 @@ class BasicTokenizer(object):
     # words in the English Wikipedia.).
     text = self._tokenize_chinese_chars(text)
 
-    orig_tokens = whitespace_tokenize(text)
+    orig_tokens = whitespace_tokenize(text) # 用空格将串分割
     split_tokens = []
     for token in orig_tokens:
       if self.do_lower_case:
@@ -256,7 +258,7 @@ class BasicTokenizer(object):
     output = []
     for char in text:
       cp = ord(char)
-      if self._is_chinese_char(cp):
+      if self._is_chinese_char(cp): # 对中文前后加空格
         output.append(" ")
         output.append(char)
         output.append(" ")
@@ -264,7 +266,7 @@ class BasicTokenizer(object):
         output.append(char)
     return "".join(output)
 
-  def _is_chinese_char(self, cp):
+  def _is_chinese_char(self, cp:int):
     """Checks whether CP is the codepoint of a CJK character."""
     # This defines a "chinese character" as anything in the CJK Unicode block:
     #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
@@ -345,7 +347,7 @@ class WordpieceTokenizer(object):
           substr = "".join(chars[start:end])
           if start > 0:
             substr = "##" + substr
-          if substr in self.vocab:
+          if substr in self.vocab: # 词表
             cur_substr = substr
             break
           end -= 1
