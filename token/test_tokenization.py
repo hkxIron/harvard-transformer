@@ -56,14 +56,12 @@ def test_full_tokenizer():
         vocab_file = vocab_writer.name
 
     tokenizer = tokenization.FullTokenizer(vocab_file)
-    os.unlink(vocab_file)
+    os.unlink(vocab_file) # 方法用于删除文件，如果文件是一个目录则返回一个错误
 
     tokens = tokenizer.tokenize(u"UNwant\u00E9d,running")
     print("tokens:", tokens)
     tf.assert_equal(tokens, ["un", "##want", "##ed", ",", "runn", "##ing"])
-
     tf.assert_equal(tokenizer.convert_tokens_to_ids(tokens), [7, 4, 5, 10, 8, 9])
-
 
 def test_basic_tokenizer_lower():
     tokenizer = tokenization.BasicTokenizer(do_lower_case=True)
@@ -101,7 +99,15 @@ def test_wordpiece_tokenizer():
 
 def test_convert_tokens_to_ids():
     vocab_tokens = [
-        "[UNK]", "[CLS]", "[SEP]", "want", "##want", "##ed", "wa", "un", "runn",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "want",
+        "##want",
+        "##ed",
+        "wa",
+        "un",
+        "runn",
         "##ing"
     ]
 
@@ -111,7 +117,6 @@ def test_convert_tokens_to_ids():
 
     tf.assert_equal(
         tokenization.convert_tokens_to_ids(vocab, ["un", "##want", "##ed", "runn", "##ing"]), [7, 4, 5, 8, 9])
-
 
 def test_is_whitespace():
     assert (tokenization._is_whitespace(u" "))
