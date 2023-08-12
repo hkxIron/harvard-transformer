@@ -94,7 +94,7 @@ class PositionWiseFeedForward(nn.Module):
     # 注意：d_ff 一般比d_model大很多,如d_ff=2048, d_model=512
     def __init__(self, d_model:int, d_ff:int, dropout=0.1):
         super(PositionWiseFeedForward, self).__init__()
-        self.dense1 = nn.Linear(d_model, d_ff, bias=True)
+        self.dense1 = nn.Linear(d_model, d_ff, bias=True) # 注意：nn.Linear构造函数中会将其中的weight, bias参数初始化
         self.dense2 = nn.Linear(d_ff, d_model, bias=True)
         self.dropout = nn.Dropout(dropout)
 
@@ -375,6 +375,8 @@ class NormDropoutResidual(nn.Module):
         2. attention(self_attn or cross_attn or feed_forward)
         3. dropout
         4. residual
+        或： 
+        1. layer norm + sublayer + dropout + residual
         """
         layer_normed = self.norm(x)
         attention_or_feedforward = attention_or_feedforward_layer_fn(layer_normed)
