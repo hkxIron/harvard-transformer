@@ -333,9 +333,9 @@ class Encoders(nn.Module):
 # sub-layers, followed by layer normalization
 # [(cite)](https://arxiv.org/abs/1607.06450).
 
+# LayerNorm很方便处理nlp中序列长度不固定的问题,与batch, seq_len无关
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)."
-
     def __init__(self, features:int, eps=1e-6):
         super(LayerNorm, self).__init__()
         # a_2,b_2为需要学习的参数
@@ -345,12 +345,12 @@ class LayerNorm(nn.Module):
 
     # x:[batch, seq_len, d_model]
     def forward(self, x:Tensor)->Tensor:
-        # x:[batch, seq_len, features=model_size]
+        # x:[batch, seq_len, features=d_model]
         # mean:[batch, seq_len, 1]
         mean = x.mean(dim=-1, keepdim=True) # 即模型的每一个维度上计算均值与方差
-        # mean:[batch, seq_len, 1]
+        # std:[batch, seq_len, 1]
         std = x.std(dim=-1, keepdim=True)
-        # out:[batch, seq_len, features]
+        # out:[batch, seq_len, features=d_model]
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 class NormDropoutResidual(nn.Module):
