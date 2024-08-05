@@ -16,7 +16,7 @@ import copy
 import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
-import altair as alt
+#import altair as alt
 from typing import Optional,Union,Any,List,Tuple
 #from torch._tensor import Tensor
 from torch import Tensor
@@ -213,7 +213,7 @@ class MultiHeadedAttention(nn.Module):
             # Same mask applied to all head_num heads.
             # mask:[batch, 1, seq_len] => [batch, head=1, 1, seq_len], 添加一个head的维度
             #      [batch, seq_len-1, seq_len-1] => [batch, head=1, seq_len-1,seq_len-1], 添加一个head的维度
-            mask = mask.unsqueeze(1)
+            mask = mask.unsqueeze(dim=1)
 
         batch = query.size(0)
         seq_len = query.size(1)
@@ -502,6 +502,7 @@ class EncoderDecoder(nn.Module):
         return out
 
 """
+casual_mask:即因果mask
 subsequent_mask(3): 
 => # 可见性是下三角矩阵, 即CasualLM
 tensor([[[ True, False, False],
