@@ -31,6 +31,18 @@ RUN_EXAMPLES = True
 # %%
 # Some convenience helper functions used throughout the notebook
 
+"""
+如果出现以下错误：
+A module that was compiled using NumPy 1.x cannot be run in NumPy 2.0.0 as it may crash. To support both 1.x and 2.x versions of NumPy, modules must be compiled with NumPy 2.0. Some module may need to rebuild instead e.g. with 'pybind11>=2.12'.
+
+If you are a user of the module, the easiest solution will be to downgrade to 'numpy<2' or try to upgrade the affected module. We expect that some modules will need time to support NumPy 2.
+
+需要先卸载numpy2.0再安装1.0
+pip uninstall numpy
+pip install numpy==1.26.4
+
+"""
+
 
 def is_interactive_notebook():
     return __name__ == "__main__"
@@ -690,8 +702,8 @@ def test_layer_norm():
 
 
 if __name__ == '__main__':
+    #load_or_train_model() # 下载数据有问题，无法运行
     #test_layer_norm()
-    #load_or_train_model()
     example_simple_copy_model()
 
     if False:
