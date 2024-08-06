@@ -690,9 +690,9 @@ def test_layer_norm():
 
 
 if __name__ == '__main__':
-    test_layer_norm()
+    #test_layer_norm()
     #load_or_train_model()
-    #example_simple_copy_model()
+    example_simple_copy_model()
 
     if False:
         test_norm()
