@@ -16,7 +16,7 @@ import copy
 import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
-import altair as alt
+#import altair as alt
 from typing import Optional,Union,Any,List,Tuple
 #from torch._tensor import Tensor
 from torch import Tensor
@@ -94,8 +94,9 @@ class PositionWiseFeedForward(nn.Module):
     # 注意：d_ff 一般比d_model大很多,如d_ff=2048, d_model=512
     def __init__(self, d_model:int, d_ff:int, dropout=0.1):
         super(PositionWiseFeedForward, self).__init__()
-        self.dense1 = nn.Linear(d_model, d_ff, bias=True)
-        self.dense2 = nn.Linear(d_ff, d_model, bias=True)
+        # feedForward也称为up_proj,down_proj,d_ff也称为intermediate size
+        self.up_proj = nn.Linear(d_model, d_ff, bias=True) # 注意：nn.Linear构造函数中会将其中的weight, bias参数初始化
+        self.down_proj = nn.Linear(d_ff, d_model, bias=True)
         self.dropout = nn.Dropout(dropout)
 
     # x:[batch,seq_len, d_model]
@@ -103,7 +104,7 @@ class PositionWiseFeedForward(nn.Module):
     def forward(self, x:Tensor) -> Tensor:
         # 注意：第二层后面没有激活函数!!!
         # 第二层没有激活函数，原因是为了恢复出x, 即对输入的x进行压缩后恢复
-        return self.dense2(self.dropout(self.dense1(x).relu())) # position_feedforward第一层非线性激活用的是relu
+        return self.down_proj(self.dropout(self.up_proj(x).relu())) # position_feedforward第一层非线性激活用的是relu
 
 class VocabEmbedding(nn.Module):
     def __init__(self, d_model:int, vocab:int):
@@ -138,7 +139,8 @@ PE是一个二维矩阵，即[max_len, d_model], 每行为position, 每列为enc
 PE的周期为：
 T(pos) = 2*pai*power(10000, encoding_dim/d_model), encoding_dim=0时，周期 T(pos)= 2*pai, encoding_dim=d_model时，T(pos) = 2*pai*10000~=6w
 
-使用训练的encoding作为position encoding也是相同的效果，但sin可以处理比训练遇到的更长的序列，即比embedding更好
+使用训练的encoding作为position encoding也是相同的效果，但sin可以处理比训练遇到的更长的序列（外推），即比embedding更好
+BERT中就使用的是随机初始化训练,而不是用sin/cos encoding,猜测是因为bert处理的不是生成类的任务，不需要很长的外推
 """
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
@@ -211,7 +213,7 @@ class MultiHeadedAttention(nn.Module):
             # Same mask applied to all head_num heads.
             # mask:[batch, 1, seq_len] => [batch, head=1, 1, seq_len], 添加一个head的维度
             #      [batch, seq_len-1, seq_len-1] => [batch, head=1, seq_len-1,seq_len-1], 添加一个head的维度
-            mask = mask.unsqueeze(1)
+            mask = mask.unsqueeze(dim=1)
 
         batch = query.size(0)
         seq_len = query.size(1)
@@ -247,7 +249,7 @@ class MultiHeadedAttention(nn.Module):
         元信息中的 重新指定 stride。 torch.view 方法约定了不修改数组本身，只是使用新的形状查看数
         据。如果我们在 transpose、permute 操作后执行 view，Pytorch 会抛出错误：view size is not compatible with input tensor's size and stride
         view 仅在底层数组上使用指定的形状进行变形,transpose、 permute 后使用 contiguous 方法
-        则会重新开辟一块内存空间保证数据是在逻辑顺序和内存中是 一致的，连续内存布局减少了CPU对对内存的请求次数
+        则会重新开辟一块内存空间保证数据是在逻辑顺序和内存中是一致的，连续内存布局减少了CPU对对内存的请求次数, 一般建议在view之前需要调用一次
         """
         # 3) "Concat" using a view and apply a final linear.
         # x: [batch, head_num, seq_len, d_k]
@@ -333,9 +335,9 @@ class Encoders(nn.Module):
 # sub-layers, followed by layer normalization
 # [(cite)](https://arxiv.org/abs/1607.06450).
 
+# LayerNorm很方便处理nlp中序列长度不固定的问题,与batch, seq_len无关
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)."
-
     def __init__(self, features:int, eps=1e-6):
         super(LayerNorm, self).__init__()
         # a_2,b_2为需要学习的参数
@@ -345,12 +347,12 @@ class LayerNorm(nn.Module):
 
     # x:[batch, seq_len, d_model]
     def forward(self, x:Tensor)->Tensor:
-        # x:[batch, seq_len, features=model_size]
+        # x:[batch, seq_len, features=d_model]
         # mean:[batch, seq_len, 1]
-        mean = x.mean(dim=-1, keepdim=True) # 即模型的每一个维度上计算均值与方差
-        # mean:[batch, seq_len, 1]
+        mean = x.mean(dim=-1, keepdim=True) # 即在d_model=hidden_size这一维度上计算均值与方差, batch_norm在batch这一维度计算均值与方差，即
+        # std:[batch, seq_len, 1]
         std = x.std(dim=-1, keepdim=True)
-        # out:[batch, seq_len, features]
+        # out:[batch, seq_len, features=d_model]
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 class NormDropoutResidual(nn.Module):
@@ -375,6 +377,8 @@ class NormDropoutResidual(nn.Module):
         2. attention(self_attn or cross_attn or feed_forward)
         3. dropout
         4. residual
+        或： 
+        1. layer norm + sublayer + dropout + residual
         """
         layer_normed = self.norm(x)
         attention_or_feedforward = attention_or_feedforward_layer_fn(layer_normed)
@@ -498,6 +502,7 @@ class EncoderDecoder(nn.Module):
         return out
 
 """
+casual_mask:即因果mask
 subsequent_mask(3): 
 => # 可见性是下三角矩阵, 即CasualLM
 tensor([[[ True, False, False],
