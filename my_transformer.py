@@ -91,12 +91,12 @@ class PositionWiseFeedForward(nn.Module):
     每个位置都是分开并行向前传播的，但它们的参数w是共享的，所以被称为position-wise, seq_len 代表的就是position
     """
 
-    # 注意：d_ff 一般比d_model大很多,如d_ff=2048, d_model=512
-    def __init__(self, d_model:int, d_ff:int, dropout=0.1):
+    # 注意intermediate_size 一般比d_model大很多,如intermediate_size=2048, d_model=512
+    def __init__(self, d_model:int, intermediate_size:int, dropout=0.1):
         super(PositionWiseFeedForward, self).__init__()
         # feedForward也称为up_proj,down_proj,d_ff也称为intermediate size
-        self.up_proj = nn.Linear(d_model, d_ff, bias=True) # 注意：nn.Linear构造函数中会将其中的weight, bias参数初始化
-        self.down_proj = nn.Linear(d_ff, d_model, bias=True)
+        self.up_proj = nn.Linear(d_model, intermediate_size, bias=True) # 注意：nn.Linear构造函数中会将其中的weight, bias参数初始化
+        self.down_proj = nn.Linear(intermediate_size, d_model, bias=True)
         self.dropout = nn.Dropout(dropout)
 
     # x:[batch,seq_len, d_model]
@@ -688,7 +688,7 @@ class LabelSmoothing(nn.Module):
 background:
 在CasualLM中，模型在inference时需要完成如下步骤：
 1. 将context对应的Input ids映射为对应的Embeddings
-2. 经过N层transformer，计算对应的logits
+2. 经过N层transformer，计算对应的logits(还未经过softmax/sigmoid激活，可以视为模型对每个类别的置信度，但并不直接表示概率)
 3. 取logits的最后一位，按指定的采样方法选择出当前预测的token
 4. 判断是否可以停止推理
   1. 若该token是停止符，或此时已达到最大长度，则停止推理
@@ -1139,7 +1139,7 @@ def train_worker(
     is_main_process = True
     if is_distributed:
         dist.init_process_group("nccl", init_method="env://", rank=gpu_id, world_size=ngpus_per_node)
-        model = DDP(model, device_ids=[gpu_id])
+        model = DDP(model, device_ids=[gpu_id]) # 数据并行
         module = model.module
         is_main_process = gpu_id == 0
 
