@@ -314,9 +314,9 @@ def clones(module:nn.Module, N:int):
 class Encoders(nn.Module):
     "Core encoders is a stack of N layers"
 
-    def __init__(self, layer:EncoderLayer, N:int=6):
+    def __init__(self, layer:EncoderLayer, layer_num:int=6):
         super(Encoders, self).__init__()
-        self.layers:nn.ModuleList[EncoderLayer] = clones(layer, N)
+        self.layers:nn.ModuleList[EncoderLayer] = clones(layer, layer_num)
         self.norm = LayerNorm(features=layer.size)
 
     # x:[batch, seq_len, d_model]
@@ -338,6 +338,9 @@ class Encoders(nn.Module):
 # LayerNorm很方便处理nlp中序列长度不固定的问题,与batch, seq_len无关
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)."
+    """
+    在大模型中，一般使用RMSNorm,而非LayerNorm,其计算速度更快
+    """
     def __init__(self, features:int, eps=1e-6):
         super(LayerNorm, self).__init__()
         # a_2,b_2为需要学习的参数
@@ -398,7 +401,7 @@ class DecoderLayer(nn.Module):
         self.self_attn:MultiHeadedAttention = self_attn
         self.src_attn:MultiHeadedAttention = src_attn
         self.feed_forward:PositionWiseFeedForward = feed_forward
-        self.sublayer:nn.ModuleList[NormDropoutResidual] = clones(NormDropoutResidual(size, dropout), 3)
+        self.norm_and_add:nn.ModuleList[NormDropoutResidual] = clones(NormDropoutResidual(size, dropout), 3)
 
     # x:[batch, seq_len-1, d_model]
     # encoder_memory:[batch, seq_len, d_model]
@@ -406,30 +409,32 @@ class DecoderLayer(nn.Module):
     # tgt_mask:[batch,seq_len-1,seq_len-1]
     # return: [batch, seq_len-1, d_model]
     def forward(self, x:Tensor, encoder_memory:Tensor, src_mask:Tensor, tgt_mask:Tensor):
-        "Follow Figure 1 (right) for connections."
-
         """
-        现在是pre_norm, 原始paper中是post_norm
         1. layer norm + self attention + dropout + residual
         2. layer norm + feedforward + dropout + residual
         3. layer norm + src_target cross attention  + dropout + residual
         4. layer norm + feedforward + dropout + residual
+
+        注意：
+        1.现在是pre_norm, 原始paper中是post_norm
+        2.tgt_mask是在self_attention中使用
+        3.src_mask是在cross_attention中使用
         """
         # x:[batch, seq_len-1, d_model]
-        # 先self attention
-        x = self.sublayer[0](x, lambda x: self.self_attn(query=x, key=x, value=x, mask=tgt_mask))
-        # 之后cross attention
-        x = self.sublayer[1](x, lambda x: self.src_attn(query=x, key=encoder_memory, value=encoder_memory, mask=src_mask))
-        # feed_forward
-        x = self.sublayer[2](x, self.feed_forward)
+        # 1.self attention
+        x = self.norm_and_add[0](x, lambda t: self.self_attn(query=t, key=t, value=t, mask=tgt_mask))
+        # 2.cross attention
+        x = self.norm_and_add[1](x, lambda t: self.src_attn(query=t, key=encoder_memory, value=encoder_memory, mask=src_mask))
+        # 3.feed_forward
+        x = self.norm_and_add[2](x, self.feed_forward)
         return x
 
 class Decoders(nn.Module):
     "Generic N layer decoders with masking."
 
-    def __init__(self, layer:DecoderLayer, N:int):
+    def __init__(self, layer:DecoderLayer, layer_num:int):
         super(Decoders, self).__init__()
-        self.layers:nn.ModuleList[DecoderLayer] = clones(layer, N)
+        self.layers:nn.ModuleList[DecoderLayer] = clones(layer, layer_num)
         self.norm = LayerNorm(features=layer.size)
 
     # target_embed:[batch, seq_len-1, d_model]
@@ -442,7 +447,7 @@ class Decoders(nn.Module):
             x = layer(x, memory, src_mask, tgt_mask)
         return self.norm(x)
 
-class EncoderDecoder(nn.Module):
+class EncoderDecoderTransformer(nn.Module):
     """
     A standard Encoder-Decoder(Transformer) architecture. Base for this and many
     other models.
@@ -452,7 +457,7 @@ class EncoderDecoder(nn.Module):
                  src_embed:EmbeddingPlusPositionEncoding,
                  tgt_embed:EmbeddingPlusPositionEncoding,
                  generator:Generator):
-        super(EncoderDecoder, self).__init__()
+        super(EncoderDecoderTransformer, self).__init__()
         self.encoders:Encoders = encoder
         self.decoders:Decoders = decoder
         self.src_embed:EmbeddingPlusPositionEncoding = src_embed
@@ -469,6 +474,9 @@ class EncoderDecoder(nn.Module):
         典型的翻译encoder-decoder架构
         1.先对所有层进行encode生成memory
         2.再对tgt_input_ids进行解码
+        
+        注章：在EncoderDecoder的Transformer架构中，PositionEmbedding只在第一层显式加入，
+        但在现在LLM中，如LLama中的ROPE则是在每层的attention时均会加入
         """
         # enc_memory:[batch, seq_len, d_model]
         enc_memory = self.encode(src_ids, src_mask)
@@ -713,7 +721,7 @@ target：使得multi-round session中延迟不随会话轮数而增加
 # > This code predicts a translation using greedy decoding for simplicity.
 # src:[batch=1, seq_len]
 # src_mask:[batch=1, 1,seq_len]
-def greedy_decode(model:EncoderDecoder, src:Tensor, src_mask:Tensor, max_len:int, start_symbol:int)->Tensor:
+def greedy_decode(model:EncoderDecoderTransformer, src:Tensor, src_mask:Tensor, max_len:int, start_symbol:int)->Tensor:
     # memory:[batch=1, seq_len, d_model]
     memory = model.encode(src, src_mask)
     # ys:[batch=1,seq_len=1]
@@ -745,21 +753,37 @@ def greedy_decode(model:EncoderDecoder, src:Tensor, src_mask:Tensor, max_len:int
 N: layer number
 注意：feedforward一般比d_model大很多
 """
-def make_model(src_vocab_size:int, tgt_vocab_size:int, layer_num=6, d_model=512, d_ff=2048, head_num=8, dropout=0.1)->EncoderDecoder:
+def make_transformer_model(src_vocab_size:int,
+                           tgt_vocab_size:int,
+                           layer_num=6,
+                           d_model=512,
+                           d_ff=2048,
+                           head_num=8,
+                           dropout=0.1)->EncoderDecoderTransformer:
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     multi_attention = MultiHeadedAttention(head_num, d_model)
     feed_forward = PositionWiseFeedForward(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
-    model = EncoderDecoder(
-        encoder=Encoders(EncoderLayer(d_model, c(multi_attention), c(feed_forward), dropout), layer_num),
-        decoder=Decoders(DecoderLayer(d_model, c(multi_attention), c(multi_attention), c(feed_forward), dropout), layer_num),
+
+    encoder_layer = EncoderLayer(d_model, c(multi_attention), c(feed_forward), dropout)
+    decoder_layer = DecoderLayer(d_model, c(multi_attention), c(multi_attention), c(feed_forward), dropout)
+
+    encoders = Encoders(layer=encoder_layer, layer_num=layer_num)
+    decoders = Decoders(layer=decoder_layer, layer_num=layer_num)
+    source_embedding = EmbeddingPlusPositionEncoding(VocabEmbedding(d_model, src_vocab_size), c(position))
+    target_embedding = EmbeddingPlusPositionEncoding(VocabEmbedding(d_model, tgt_vocab_size), c(position))
+    generator = Generator(d_model, tgt_vocab_size)
+
+    model = EncoderDecoderTransformer(
+        encoder=encoders,
+        decoder=decoders,
         # src_embed=nn.Sequential(VocabEmbedding(d_model, src_vocab_size),c(position)),
         # tgt_embed=nn.Sequential(VocabEmbedding(d_model, tgt_vocab_size),c(position)),
         # 注意：src, tgt并没有共享embedding,因为它们的embedding size不一样
-        src_embed=EmbeddingPlusPositionEncoding(VocabEmbedding(d_model, src_vocab_size), c(position)),
-        tgt_embed=EmbeddingPlusPositionEncoding(VocabEmbedding(d_model, tgt_vocab_size), c(position)),
-        generator=Generator(d_model, tgt_vocab_size),
+        src_embed=source_embedding,
+        tgt_embed=target_embedding,
+        generator=generator
     )
 
     # This was important from their code.
@@ -834,13 +858,13 @@ class SimpleLossCompute:
                                y_ids.contiguous().view(-1))
         return loss.data, loss/norm
 
-def run_epoch(data_iter, model:EncoderDecoder,
+def run_epoch(data_iter, model:EncoderDecoderTransformer,
               loss_compute:SimpleLossCompute,
               optimizer:torch.optim.Optimizer,
               scheduler:Union[LambdaLR, Any],
               mode="train",
               accum_iter=1,
-              train_state=TrainState(),):
+              train_state=TrainState(), ):
     """Train a single epoch"""
     start = time.time()
     total_tokens = 0
@@ -1128,11 +1152,11 @@ def train_worker(
     pad_idx = vocab_tgt["<blank>"] # 用blank进行padding吗？ pad_idx=2,不知为何要用<blank>作为padding
 
     #model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt), layer_num=layer_num, d_ff = d_ff, head_num=head_num)
-    model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
-                       layer_num=config['layer_num'],
-                       d_model=config['d_model'],
-                       d_ff=config['d_ff'],
-                       head_num=config['head_num'])
+    model = make_transformer_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
+                                   layer_num=config['layer_num'],
+                                   d_model=config['d_model'],
+                                   d_ff=config['d_ff'],
+                                   head_num=config['head_num'])
     model.cuda(gpu_id)
 
     module = model

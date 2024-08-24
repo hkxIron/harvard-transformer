@@ -137,7 +137,7 @@ def example_positional():
 
 
 def inference_test():
-    test_model = make_model(src_vocab_size=11, tgt_vocab_size=11, layer_num=2)
+    test_model = make_transformer_model(src_vocab_size=11, tgt_vocab_size=11, layer_num=2)
     test_model.eval() # test mode
     # src:[batch, seq_len]
     src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
@@ -304,10 +304,10 @@ def penalization_visualization():
 
 # Train the simple copy task. We can begin by trying out a simple copy-task. Given a random set of input symbols from a
 # small vocabulary, the goal is to generate back those same symbols.
-def example_simple_copy_model():
+def example_simple_transfomer_model():
     vocab_size = 10 + 1
     criterion = LabelSmoothing(vocab_size=vocab_size, padding_idx=0, smoothing=0.0)
-    model = make_model(src_vocab_size=vocab_size, tgt_vocab_size=vocab_size, layer_num=2)
+    model = make_transformer_model(src_vocab_size=vocab_size, tgt_vocab_size=vocab_size, layer_num=2)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9)
     # 用来自定义学习率
@@ -358,7 +358,7 @@ def example_simple_copy_model():
     print("greedy_decode:", pred)
     print("acc:", (src==pred).sum()/np.prod(src.shape))
 
-def run_model_example(n_examples=5)->Tuple[EncoderDecoder, List[Tuple[Batch, List[str], List[str], Tensor, str]]]:
+def run_model_example(n_examples=5)->Tuple[EncoderDecoderTransformer, List[Tuple[Batch, List[str], List[str], Tensor, str]]]:
     #global vocab_src, vocab_tgt, spacy_de, spacy_en
     spacy_de, spacy_en = load_tokenizers()
     vocab_src, vocab_tgt = load_vocab(spacy_de, spacy_en)
@@ -378,8 +378,8 @@ def run_model_example(n_examples=5)->Tuple[EncoderDecoder, List[Tuple[Batch, Lis
     # 加载模型进行预测
     #model = make_model(len(vocab_src), len(vocab_tgt), layer_num=6)
     config = get_model_config()
-    model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
-                       layer_num=config['layer_num'], d_model=config['d_model'], d_ff=config['d_ff'], head_num=config['head_num'])
+    model = make_transformer_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
+                                   layer_num=config['layer_num'], d_model=config['d_model'], d_ff=config['d_ff'], head_num=config['head_num'])
     model.load_state_dict(torch.load("multi30k_model_final.pt", map_location=torch.device("cpu")) )
 
     print("Checking Model Outputs:")
@@ -517,8 +517,8 @@ def load_or_train_model():
     else:
         print(f"load model from:{model_path}")
 
-    model = make_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
-                       layer_num=config['layer_num'], d_model=config['d_model'], d_ff=config['d_ff'], head_num=config['head_num'])
+    model = make_transformer_model(src_vocab_size=len(vocab_src), tgt_vocab_size=len(vocab_tgt),
+                                   layer_num=config['layer_num'], d_model=config['d_model'], d_ff=config['d_ff'], head_num=config['head_num'])
     # 为model加载参数
     model.load_state_dict(torch.load(model_path))
     return model
@@ -545,7 +545,7 @@ def average(model, models):
 # Load data and model for output checks
 def check_outputs(
         valid_dataloader,
-        model:EncoderDecoder,
+        model:EncoderDecoderTransformer,
         vocab_src:Vocab,
         vocab_tgt:Vocab,
         n_examples=15,
@@ -634,19 +634,19 @@ def attn_map(attn:Tensor, head:int, row_tokens:List[str], col_tokens:List[str], 
     return chart
 
 # attn: [batch, head, seq_len, seq_len]
-def get_encoder(model:EncoderDecoder, layer:int)->Tensor:
+def get_encoder(model:EncoderDecoderTransformer, layer:int)->Tensor:
     return model.encoders.layers[layer].self_attn.attn
 
 
 # attn: [batch, head, seq_len, seq_len]
-def get_decoder_self(model:EncoderDecoder, layer:int)->Tensor:
+def get_decoder_self(model:EncoderDecoderTransformer, layer:int)->Tensor:
     return model.decoders.layers[layer].self_attn.attn
 
 # attn: [batch, head, seq_len, seq_len]
-def get_decoder_src(model:EncoderDecoder, layer:int)->Tensor:
+def get_decoder_src(model:EncoderDecoderTransformer, layer:int)->Tensor:
     return model.decoders.layers[layer].src_attn.attn # cross-attention
 
-def visualize_layer(model:EncoderDecoder,
+def visualize_layer(model:EncoderDecoderTransformer,
                     layer:int,
                     get_attn_map_fn:Callable[[EncoderLayer, int], Tensor],
                     ntokens:int,
@@ -704,7 +704,7 @@ def test_layer_norm():
 if __name__ == '__main__':
     #load_or_train_model() # 下载数据有问题，无法运行
     #test_layer_norm()
-    example_simple_copy_model()
+    example_simple_transfomer_model()
 
     if False:
         test_norm()
